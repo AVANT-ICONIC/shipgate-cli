@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://capsule-render.vercel.app/api?type=waving&height=250&color=0:000000,35:111827,70:f97316,100:ec4899&text=SHIPGATE&fontColor=ffffff&fontSize=72&fontAlignY=35&desc=by%20AVANT%20ICONIC&descSize=15&descAlignY=52&animation=scaleIn" alt="ShipGate header" width="100%" />
+<img src="https://capsule-render.vercel.app/api?type=waving&height=250&color=0:fef08a,35:bef264,70:fb923c,100:ec4899&text=SHIPGATE&fontColor=ffffff&fontSize=72&fontAlignY=35&desc=by%20AVANT%20ICONIC&descSize=15&descAlignY=52&animation=scaleIn" alt="ShipGate header" width="100%" />
 
 <br />
 
@@ -368,6 +368,6 @@ later. See [LICENSE](LICENSE).
 <br />
 <br />
 
-<img src="https://capsule-render.vercel.app/api?type=waving&section=footer&height=130&color=0:ec4899,50:f97316,100:000000" alt="ShipGate footer" width="100%" />
+<img src="https://capsule-render.vercel.app/api?type=waving&section=footer&height=130&color=0:ec4899,50:fb923c,100:fef08a" alt="ShipGate footer" width="100%" />
 
 </div>

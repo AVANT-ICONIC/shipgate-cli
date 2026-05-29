@@ -39,6 +39,7 @@
 - Added public GitHub repository metadata for `AVANT-ICONIC/shipgate-cli`.
 - Documented the temporary GitHub Release tarball install path for testers.
 - Restyled the README with the public AVANT ICONIC visual format and orange-pink ShipGate branding.
+- Lightened the README header and footer gradients with yellow and lime accents.
 
 ## 0.1.0 - Initial scaffold
 
