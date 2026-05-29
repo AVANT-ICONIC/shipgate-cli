@@ -40,6 +40,7 @@
 - Documented the temporary GitHub Release tarball install path for testers.
 - Restyled the README with the public AVANT ICONIC visual format and orange-pink ShipGate branding.
 - Lightened the README header and footer gradients with yellow and lime accents.
+- Fixed the README release badge so it includes the current prerelease tester tarball.
 
 ## 0.1.0 - Initial scaffold
 

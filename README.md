@@ -24,7 +24,7 @@
   <img src="https://img.shields.io/badge/Node.js-20+-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js" />
   <img src="https://img.shields.io/badge/Playwright-browser%20flows-45ba4b?style=flat-square&logo=playwright&logoColor=white" alt="Playwright" />
   <img src="https://img.shields.io/badge/License-AGPL--3.0--or--later-f97316?style=flat-square&logo=opensourceinitiative&logoColor=white" alt="AGPL-3.0-or-later" />
-  <img src="https://img.shields.io/github/v/release/AVANT-ICONIC/shipgate-cli?color=ec4899&style=flat-square" alt="release" />
+  <img src="https://img.shields.io/github/v/release/AVANT-ICONIC/shipgate-cli?include_prereleases&color=ec4899&style=flat-square" alt="release" />
 </p>
 
 <p align="center">
