@@ -1,0 +1,9 @@
+{
+  "profile": "node-cli",
+  "packageManager": "npm",
+  "commands": {
+    "test": "node scripts/fail-test.mjs",
+    "build": "node scripts/should-not-run.mjs"
+  },
+  "requiredFiles": ["README.md", "package.json"]
+}

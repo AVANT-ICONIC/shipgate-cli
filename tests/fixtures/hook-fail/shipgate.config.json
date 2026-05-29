@@ -1,0 +1,16 @@
+{
+  "profile": "generic",
+  "packageManager": "npm",
+  "hooks": {
+    "beforeVerify": [
+      {
+        "name": "failing setup",
+        "command": "node scripts/fail-hook.mjs"
+      }
+    ]
+  },
+  "commands": {
+    "test": "node scripts/should-not-run.mjs"
+  },
+  "requiredFiles": ["README.md", "package.json"]
+}

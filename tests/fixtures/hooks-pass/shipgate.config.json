@@ -1,0 +1,41 @@
+{
+  "profile": "generic",
+  "packageManager": "npm",
+  "hooks": {
+    "beforeVerify": [
+      {
+        "name": "prepare verify marker",
+        "command": "node scripts/write-marker.mjs verify-marker.txt before-verify"
+      }
+    ],
+    "beforeFlows": [
+      {
+        "name": "prepare flow marker",
+        "command": "node scripts/write-marker.mjs flow-marker.txt before-flows"
+      }
+    ],
+    "afterFlows": [
+      {
+        "name": "after flows hook",
+        "command": "node scripts/write-marker.mjs after-flows-marker.txt after-flows"
+      }
+    ],
+    "afterVerify": [
+      {
+        "name": "after verify hook",
+        "command": "node scripts/write-marker.mjs after-verify-marker.txt after-verify"
+      }
+    ]
+  },
+  "commands": {
+    "test": "node scripts/assert-marker.mjs verify-marker.txt before-verify"
+  },
+  "flows": [
+    {
+      "name": "flow marker exists",
+      "kind": "file",
+      "path": "flow-marker.txt"
+    }
+  ],
+  "requiredFiles": ["README.md", "package.json"]
+}

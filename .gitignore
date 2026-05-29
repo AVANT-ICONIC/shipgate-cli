@@ -1,0 +1,13 @@
+node_modules
+dist
+coverage
+.shipgate/
+.shipgate/artifacts
+.shipgate/reports
+.shipgate/latest-*.md
+.shipgate/latest-result.json
+.env
+.env.local
+.env.*
+*.log
+.DS_Store

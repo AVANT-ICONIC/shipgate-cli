@@ -1,0 +1,26 @@
+{
+  "profile": "generic",
+  "packageManager": "auto",
+  "workspace": {
+    "root": "../.."
+  },
+  "commands": {
+    "test": "node scripts/check-workspace.mjs"
+  },
+  "hooks": {
+    "beforeFlows": [
+      {
+        "name": "write generated marker",
+        "command": "node scripts/write-file.mjs generated-marker.txt ok"
+      }
+    ]
+  },
+  "flows": [
+    {
+      "name": "generated marker exists",
+      "kind": "file",
+      "path": "generated-marker.txt"
+    }
+  ],
+  "requiredFiles": ["README.md", "package.json"]
+}

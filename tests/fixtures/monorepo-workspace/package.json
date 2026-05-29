@@ -1,0 +1,7 @@
+{
+  "name": "shipgate-monorepo-workspace-fixture",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ]
+}

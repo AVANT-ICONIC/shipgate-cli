@@ -1,0 +1,23 @@
+image: node:20
+
+stages:
+  - verify
+
+shipgate:
+  stage: verify
+  timeout: 20m
+  before_script:
+    - corepack enable
+    - pnpm install --frozen-lockfile
+    - pnpm exec playwright install --with-deps chromium
+  script:
+    - pnpm exec shipgate verify --fresh
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - .shipgate/latest-report.md
+      - .shipgate/latest-result.json
+      - .shipgate/latest-repair-prompt.md
+      - .shipgate/reports/
+      - .shipgate/artifacts/

@@ -1,0 +1,25 @@
+{
+  "profile": "node-cli",
+  "packageManager": "npm",
+  "commands": {
+    "test": "node src/cli.js --help",
+    "build": "node scripts/build.mjs"
+  },
+  "flows": [
+    {
+      "name": "built CLI help works",
+      "kind": "cli",
+      "command": "node dist/cli.js --help",
+      "expect": {
+        "exitCode": 0,
+        "stdoutIncludes": ["Usage: passing-cli"]
+      }
+    },
+    {
+      "name": "built CLI exists",
+      "kind": "file",
+      "path": "dist/cli.js"
+    }
+  ],
+  "requiredFiles": ["README.md", "package.json", "src/cli.js"]
+}

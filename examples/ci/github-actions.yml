@@ -1,0 +1,47 @@
+name: ShipGate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install browser dependencies
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run ShipGate
+        run: pnpm exec shipgate verify --fresh
+
+      - name: Upload ShipGate output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shipgate-output
+          if-no-files-found: ignore
+          path: |
+            .shipgate/latest-report.md
+            .shipgate/latest-result.json
+            .shipgate/latest-repair-prompt.md
+            .shipgate/reports/**
+            .shipgate/artifacts/**

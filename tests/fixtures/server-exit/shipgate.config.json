@@ -1,0 +1,20 @@
+{
+  "profile": "generic",
+  "packageManager": "npm",
+  "commands": {
+    "start": "node scripts/fail-start.mjs"
+  },
+  "app": {
+    "kind": "api",
+    "url": "http://127.0.0.1:1",
+    "readyTimeoutMs": 5000
+  },
+  "flows": [
+    {
+      "name": "health endpoint works",
+      "kind": "api",
+      "url": "http://127.0.0.1:1"
+    }
+  ],
+  "requiredFiles": ["README.md", "package.json"]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "node-cli-basic",
+  "type": "module",
+  "bin": {
+    "demo": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "mkdir -p dist && cp src/cli.js dist/cli.js",
+    "typecheck": "echo no typecheck",
+    "test": "node src/cli.js --help",
+    "lint": "echo no lint"
+  }
+}
