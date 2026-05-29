@@ -13,11 +13,15 @@ const tag = `v${version}`;
 const packageName = `shipgate-cli-${version}.tgz`;
 const tmp = await mkdtemp(path.join(tmpdir(), "shipgate-release-"));
 const installScriptPath = fileURLToPath(new URL("../install.sh", import.meta.url));
+const githubEnv = process.env.SHIPGATE_GH_HOME
+  ? { ...process.env, HOME: process.env.SHIPGATE_GH_HOME }
+  : process.env;
 
-async function run(command) {
+async function run(command, env = process.env) {
   const result = await execaCommand(command, {
     shell: true,
     stdio: "inherit",
+    env,
     reject: false
   });
 
@@ -69,6 +73,6 @@ await run([
   "--notes-file",
   JSON.stringify(notesPath),
   "--prerelease"
-].join(" "));
+].join(" "), githubEnv);
 
 console.log(`Published ${tag} to https://github.com/${repo}/releases/tag/${tag}`);
