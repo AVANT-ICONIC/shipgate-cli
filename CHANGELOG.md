@@ -37,6 +37,7 @@
 - Expanded `TODO.md` with adversarial audit findings, open hardening work, distribution options, and update-strategy notes.
 - Added roadmap notes for guarded click exploration and GitHub Release tarball distribution while npm publishing is unavailable.
 - Added public GitHub repository metadata for `AVANT-ICONIC/shipgate-cli`.
+- Documented the temporary GitHub Release tarball install path for testers.
 
 ## 0.1.0 - Initial scaffold
 

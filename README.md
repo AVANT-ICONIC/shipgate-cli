@@ -49,6 +49,14 @@ npm install --save-dev @shipgate/cli
 npx shipgate verify --fresh
 ```
 
+Until the npm package is published, testers can install the GitHub Release
+tarball:
+
+```bash
+npm install -g https://github.com/AVANT-ICONIC/shipgate-cli/releases/download/v0.1.0/shipgate-cli-0.1.0.tgz
+shipgate doctor
+```
+
 From this source repository:
 
 ```bash
