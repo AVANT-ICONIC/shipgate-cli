@@ -123,7 +123,7 @@ work, and ShipGate checks that reality agrees.
 Install the current GitHub Release tarball globally:
 
 ```bash
-npm install -g https://github.com/AVANT-ICONIC/shipgate-cli/releases/download/v0.1.0/shipgate-cli-0.1.0.tgz
+npm install -g https://github.com/AVANT-ICONIC/shipgate-cli/releases/download/v0.1.1/shipgate-cli-0.1.1.tgz
 shipgate doctor
 ```
 
@@ -138,8 +138,21 @@ shipgate verify --fresh
 Project-local install also works:
 
 ```bash
-npm install -D https://github.com/AVANT-ICONIC/shipgate-cli/releases/download/v0.1.0/shipgate-cli-0.1.0.tgz
+npm install -D https://github.com/AVANT-ICONIC/shipgate-cli/releases/download/v0.1.1/shipgate-cli-0.1.1.tgz
 npx shipgate verify --fresh
+```
+
+Update intentionally when a new tester release is available:
+
+```bash
+shipgate update
+shipgate update --yes
+```
+
+The release also includes a transparent installer wrapper:
+
+```bash
+curl -fsSL https://github.com/AVANT-ICONIC/shipgate-cli/releases/download/v0.1.1/install.sh | sh
 ```
 
 Once the package is published to npm, the normal install path will be:
@@ -253,6 +266,7 @@ See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full usage reference.
 | `shipgate schema` | Print the ShipGate config JSON Schema. |
 | `shipgate schema --out shipgate.schema.json` | Write the schema to a file. |
 | `shipgate discover` | Prototype helper that drafts weak browser smoke checks from a running app. |
+| `shipgate update` | Print or run the command that updates a GitHub-release or npm install. |
 | `shipgate mcp` | Start the stdio MCP server for agent clients. |
 
 ---
@@ -268,6 +282,11 @@ files, stale `node_modules` assumptions, local cache dependencies, and
 environment leakage.
 
 By default ShipGate does not copy `.env` or `.env.*` files.
+
+Config-controlled paths are intentionally constrained. `requiredFiles`, file
+flows, artifact directories, and discovery output paths must be relative and
+stay inside the project. Command `cwd` may move inside the configured workspace
+root for monorepos, but it cannot escape the copied workspace.
 
 ---
 
@@ -288,6 +307,10 @@ Every verification run writes `.shipgate` output:
   reports/
     <run-id>-report.md
 ```
+
+Use `artifacts.dir`, `artifacts.logs`, `artifacts.screenshots`, and
+`artifacts.traces` to move or disable captured artifacts. The report and latest
+result stay under `.shipgate` so agents have a stable handoff location.
 
 Successful runs remove stale repair prompts. Failed runs keep enough information
 for another person or agent to diagnose the problem without reading chat history.

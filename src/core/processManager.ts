@@ -3,11 +3,12 @@ import path from "node:path";
 import { execa, execaCommand, type ResultPromise } from "execa";
 import type { CommandStepConfig, ArtifactRef } from "../config/schema.js";
 import type { ArtifactStore } from "./artifactStore.js";
+import { resolveLocalPath } from "../utils/pathSafety.js";
 
 export type ManagedProcess = {
   process: ResultPromise;
-  stdoutPath: string;
-  stderrPath: string;
+  stdoutPath?: string;
+  stderrPath?: string;
   artifacts: ArtifactRef[];
   stop(): Promise<void>;
 };
@@ -105,17 +106,23 @@ export async function startManagedProcess(
   step: CommandStepConfig,
   cwd: string,
   store: ArtifactStore,
-  env: Record<string, string> = {}
+  env: Record<string, string> = {},
+  allowedCwdRoot = cwd
 ): Promise<ManagedProcess> {
-  await mkdir(store.commandLogsDir, { recursive: true });
   const stdoutPath = path.join(store.commandLogsDir, "server.stdout.log");
   const stderrPath = path.join(store.commandLogsDir, "server.stderr.log");
+  const resolvedCwd = step.cwd
+    ? resolveLocalPath(cwd, step.cwd, `${step.name} cwd`, allowedCwdRoot)
+    : cwd;
 
-  await writeFile(stdoutPath, "", "utf8");
-  await writeFile(stderrPath, "", "utf8");
+  if (store.logsEnabled) {
+    await mkdir(store.commandLogsDir, { recursive: true });
+    await writeFile(stdoutPath, "", "utf8");
+    await writeFile(stderrPath, "", "utf8");
+  }
 
   const child = execaCommand(step.command, {
-    cwd: step.cwd ? path.resolve(cwd, step.cwd) : cwd,
+    cwd: resolvedCwd,
     shell: true,
     reject: false,
     forceKillAfterDelay: 3000,
@@ -127,22 +134,24 @@ export async function startManagedProcess(
     }
   });
 
-  child.stdout?.on("data", (chunk) => {
-    void appendFile(stdoutPath, chunk.toString());
-  });
+  if (store.logsEnabled) {
+    child.stdout?.on("data", (chunk) => {
+      void appendFile(stdoutPath, chunk.toString());
+    });
 
-  child.stderr?.on("data", (chunk) => {
-    void appendFile(stderrPath, chunk.toString());
-  });
+    child.stderr?.on("data", (chunk) => {
+      void appendFile(stderrPath, chunk.toString());
+    });
+  }
 
   return {
     process: child,
-    stdoutPath,
-    stderrPath,
-    artifacts: [
+    stdoutPath: store.logsEnabled ? stdoutPath : undefined,
+    stderrPath: store.logsEnabled ? stderrPath : undefined,
+    artifacts: store.logsEnabled ? [
       { kind: "log", label: "server stdout", path: stdoutPath },
       { kind: "log", label: "server stderr", path: stderrPath }
-    ],
+    ] : [],
     async stop() {
       await stopProcessTree(child);
     }

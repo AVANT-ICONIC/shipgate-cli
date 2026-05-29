@@ -52,13 +52,17 @@ export async function runBrowserFlow(
   let context: BrowserContext | undefined;
   let tracePath: string | undefined;
   let traceStopped = false;
+  let traceStarted = false;
 
   try {
     const { chromium } = await import("playwright");
     browser = await chromium.launch({ headless: true });
     context = await browser.newContext();
-    tracePath = path.join(store.tracesDir, `${safeName}.zip`);
-    await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+    if (store.tracesEnabled) {
+      tracePath = path.join(store.tracesDir, `${safeName}.zip`);
+      await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+      traceStarted = true;
+    }
 
     const page = await context.newPage();
     const baseUrl = config.app?.url ?? "";
@@ -113,13 +117,17 @@ export async function runBrowserFlow(
       await locator.waitFor({ state: "visible", timeout: 10000 });
     }
 
-    const screenshotPath = path.join(store.screenshotsDir, `${safeName}.png`);
-    await page.screenshot({ path: screenshotPath, fullPage: true });
-    artifacts.push({ kind: "screenshot" as const, label: `${flow.name} screenshot`, path: screenshotPath });
+    if (store.screenshotsEnabled) {
+      const screenshotPath = path.join(store.screenshotsDir, `${safeName}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      artifacts.push({ kind: "screenshot" as const, label: `${flow.name} screenshot`, path: screenshotPath });
+    }
 
-    await context.tracing.stop({ path: tracePath });
-    traceStopped = true;
-    artifacts.push({ kind: "trace" as const, label: `${flow.name} trace`, path: tracePath });
+    if (traceStarted && tracePath) {
+      await context.tracing.stop({ path: tracePath });
+      traceStopped = true;
+      artifacts.push({ kind: "trace" as const, label: `${flow.name} trace`, path: tracePath });
+    }
 
     await browser.close();
     browser = undefined;
@@ -149,7 +157,7 @@ export async function runBrowserFlow(
       }
     };
   } catch (error) {
-    if (context && !traceStopped) {
+    if (context && traceStarted && !traceStopped) {
       try {
         if (tracePath) {
           await context.tracing.stop({ path: tracePath });

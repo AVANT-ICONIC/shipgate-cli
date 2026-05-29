@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+No unreleased changes.
+
+## 0.1.1 - 2026-05-29
+
 - Added a pnpm lockfile, pinned pnpm version, and runnable ESLint flat configuration for TypeScript source checks.
 - Updated Execa process shutdown typing and options so the project typechecks against installed dependencies.
 - Corrected `defineShipGateConfig` typing so documented configurations can omit schema-defaulted fields.
@@ -41,6 +45,12 @@
 - Restyled the README with the public AVANT ICONIC visual format and orange-pink ShipGate branding.
 - Lightened the README header and footer gradients with yellow and lime accents.
 - Fixed the README release badge so it includes the current prerelease tester tarball.
+- Enforced relative, project-local path validation for required files, file flows, artifact directories, and discovery output paths.
+- Allowed command `cwd` movement only inside the configured workspace root so monorepo commands still work without escaping fresh copies.
+- Honored artifact settings for custom artifact directories, command logs, browser screenshots, and browser traces.
+- Added `shipgate update` to print or run the right GitHub Release or npm update command.
+- Added `install.sh` and `scripts/release-github.mjs` for transparent GitHub Release distribution while npm publishing is unavailable.
+- Bumped the tester package to `0.1.1`.
 
 ## 0.1.0 - Initial scaffold
 

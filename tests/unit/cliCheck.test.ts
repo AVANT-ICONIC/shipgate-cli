@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -57,6 +58,40 @@ describe("CLI checks", () => {
 
       expect(result.status).toBe("failed");
       expect(result.error).toContain("timed out");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("checks full output without writing log artifacts when logs are disabled", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "shipgate-cli-flow-no-logs-"));
+    const store = await createArtifactStore(root, "run", {
+      dir: ".shipgate/artifacts",
+      logs: false,
+      screenshots: true,
+      traces: true
+    });
+
+    try {
+      const result = await runCliFlow(
+        {
+          name: "no logs",
+          kind: "cli",
+          command: "node -e \"console.log('needle')\"",
+          expect: {
+            exitCode: 0,
+            stdoutIncludes: ["needle"],
+            stderrIncludes: []
+          }
+        },
+        root,
+        store,
+        {}
+      );
+
+      expect(result.status).toBe("passed");
+      expect(result.artifacts).toEqual([]);
+      expect(existsSync(store.commandLogsDir)).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

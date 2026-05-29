@@ -1,5 +1,9 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { Command } from "commander";
 import { describe, expect, it } from "vitest";
-import { makeDiscoverySpec } from "../../src/commands/discover.js";
+import { makeDiscoverySpec, registerDiscoverCommand } from "../../src/commands/discover.js";
 import {
   findUnsafeMatches,
   makeSafeFormInteractions,
@@ -271,5 +275,31 @@ describe("makeDiscoverySpec", () => {
     expect(spec).toContain("event.preventDefault()");
     expect(spec).toContain("page.locator(\"input[name=\\\"email\\\"]\").first().fill(\"shipgate@example.test\")");
     expect(spec).not.toContain("button 1: Send");
+  });
+});
+
+describe("discover command validation", () => {
+  it("rejects generated spec paths outside the project before crawling", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "shipgate-discover-path-test-"));
+    await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify({
+      app: {
+        url: "http://127.0.0.1:1"
+      }
+    }), "utf8");
+    await mkdir(path.join(root, "nested"), { recursive: true });
+
+    const program = new Command();
+    registerDiscoverCommand(program);
+    const originalCwd = process.cwd();
+
+    try {
+      process.chdir(root);
+      await expect(program.parseAsync(["node", "shipgate", "discover", "--out", "../escape.spec.ts"]))
+        .rejects
+        .toThrow("--out must resolve inside");
+    } finally {
+      process.chdir(originalCwd);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

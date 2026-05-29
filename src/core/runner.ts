@@ -11,7 +11,7 @@ import type {
 import { normalizeStartCommand, normalizeVerificationCommands } from "../config/normalizeCommands.js";
 import { detectPackageManager } from "../config/detectProject.js";
 import { createArtifactStore } from "./artifactStore.js";
-import { runCommandStep } from "./commandRunner.js";
+import { runCommandStep, stripRawCommandOutput } from "./commandRunner.js";
 import { createFreshCopy } from "./freshCopy.js";
 import { startManagedProcess, waitForUrl, type ManagedProcess } from "./processManager.js";
 import { runBrowserFlow } from "../browser/playwrightRunner.js";
@@ -21,6 +21,7 @@ import { runFileFlow } from "../checks/fileCheck.js";
 import { writeReport } from "./reportWriter.js";
 import { writeRepairPrompt } from "./repairPromptWriter.js";
 import { durationMs, nowIso, safeTimestamp } from "../utils/time.js";
+import { isInsidePath, pathValidationError, resolveLocalPath } from "../utils/pathSafety.js";
 
 export type VerifyOptions = {
   fresh?: boolean;
@@ -28,6 +29,13 @@ export type VerifyOptions = {
   noBrowser?: boolean;
   step?: string;
   configDir?: string;
+};
+
+const DEFAULT_ARTIFACT_CONFIG: ShipGateConfig["artifacts"] = {
+  dir: ".shipgate/artifacts",
+  logs: true,
+  screenshots: true,
+  traces: true
 };
 
 function makeStep(
@@ -57,7 +65,10 @@ function makeStep(
 async function runRequiredFiles(config: ShipGateConfig, cwd: string): Promise<StepResult> {
   const startedAt = nowIso();
   const start = Date.now();
-  const missing = config.requiredFiles.filter((file) => !existsSync(path.join(cwd, file)));
+  const missing = config.requiredFiles.filter((file) => {
+    const fullPath = resolveLocalPath(cwd, file, `requiredFiles entry "${file}"`);
+    return !existsSync(fullPath);
+  });
 
   return makeStep(
     "preflight:required-files",
@@ -87,11 +98,6 @@ function selectedFlowMatches(selected: string | undefined, flow: ShipGateConfig[
   return !selected || selected === flowStepId(flow) || selected === flow.name;
 }
 
-function isInside(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
 function resolveWorkspaceRoots(
   outputRoot: string,
   config: ShipGateConfig,
@@ -106,7 +112,7 @@ function resolveWorkspaceRoots(
     (path.relative(sourceWorkspaceRoot, configDir) || ".");
   const sourceProjectRoot = path.resolve(sourceWorkspaceRoot, projectRelativePath);
 
-  if (!isInside(sourceWorkspaceRoot, sourceProjectRoot)) {
+  if (!isInsidePath(sourceWorkspaceRoot, sourceProjectRoot)) {
     throw new Error(
       `Workspace projectDir must resolve inside workspace root. root=${sourceWorkspaceRoot} projectDir=${projectRelativePath}`
     );
@@ -119,6 +125,67 @@ function resolveWorkspaceRoots(
   };
 }
 
+function allCommandSteps(config: ShipGateConfig): Array<{ label: string; step: CommandStepConfig }> {
+  const steps: Array<{ label: string; step: CommandStepConfig }> = [];
+
+  for (const [phase, phaseSteps] of Object.entries(config.hooks) as Array<[CommandHookPhase, CommandStepConfig[]]>) {
+    for (const step of phaseSteps) {
+      steps.push({ label: `hook.${phase}.${step.name}`, step });
+    }
+  }
+
+  for (const step of normalizeVerificationCommands(config.commands)) {
+    steps.push({ label: `commands.${step.name}`, step });
+  }
+
+  const startCommand = normalizeStartCommand(config.commands);
+  if (startCommand) {
+    steps.push({ label: `commands.start.${startCommand.name}`, step: startCommand });
+  }
+
+  return steps;
+}
+
+function validateVerificationPaths(
+  config: ShipGateConfig,
+  roots: ReturnType<typeof resolveWorkspaceRoots>,
+  projectRoot: string
+): string[] {
+  const errors: string[] = [];
+  const addError = (error: string | undefined) => {
+    if (error) errors.push(error);
+  };
+
+  addError(pathValidationError(projectRoot, config.artifacts.dir, "artifacts.dir"));
+
+  for (const file of config.requiredFiles) {
+    addError(pathValidationError(roots.sourceProjectRoot, file, `requiredFiles entry "${file}"`));
+  }
+
+  for (const { label, step } of allCommandSteps(config)) {
+    if (step.cwd) {
+      addError(pathValidationError(
+        roots.sourceProjectRoot,
+        step.cwd,
+        `${label}.cwd`,
+        roots.sourceWorkspaceRoot
+      ));
+    }
+  }
+
+  for (const flow of config.flows) {
+    if (flow.kind === "file") {
+      addError(pathValidationError(
+        roots.sourceProjectRoot,
+        flow.path,
+        `file flow "${flow.name}" path`
+      ));
+    }
+  }
+
+  return errors;
+}
+
 export async function runVerification(
   projectRoot: string,
   config: ShipGateConfig,
@@ -128,7 +195,12 @@ export async function runVerification(
   const start = Date.now();
   const runId = safeTimestamp();
   const roots = resolveWorkspaceRoots(projectRoot, config, options.configDir);
-  const store = await createArtifactStore(projectRoot, runId);
+  const artifactPathError = pathValidationError(projectRoot, config.artifacts.dir, "artifacts.dir");
+  const store = await createArtifactStore(
+    projectRoot,
+    runId,
+    artifactPathError ? DEFAULT_ARTIFACT_CONFIG : config.artifacts
+  );
   const steps: StepResult[] = [];
   const artifacts = [];
   const packageManager = config.packageManager === "auto"
@@ -151,8 +223,15 @@ export async function runVerification(
       if (!selectedStepMatches(options.step, id, commandStep)) continue;
       matchedSelectedStep = true;
 
-      const result = await runCommandStep(id, commandStep, verificationRoot, store, config.env);
-      steps.push(result);
+      const result = await runCommandStep(
+        id,
+        commandStep,
+        verificationRoot,
+        store,
+        config.env,
+        verificationWorkspaceRoot
+      );
+      steps.push(stripRawCommandOutput(result));
 
       if (result.status === "failed" && result.required && config.failurePolicy.stopOnFirstCommandFailure) {
         return true;
@@ -181,9 +260,32 @@ export async function runVerification(
       });
     }
 
-    const requiredFiles = await runRequiredFiles(config, verificationRoot);
-    steps.push(requiredFiles);
-    let stopped = requiredFiles.status === "failed" && config.failurePolicy.stopOnFirstCommandFailure;
+    const pathErrors = validateVerificationPaths(config, roots, projectRoot);
+    if (pathErrors.length) {
+      const pathPolicyStartedAt = nowIso();
+      const pathPolicyStart = Date.now();
+      steps.push(makeStep(
+        "preflight:path-policy",
+        "Path policy",
+        "preflight",
+        "failed",
+        pathPolicyStartedAt,
+        pathPolicyStart,
+        pathErrors.join("\n"),
+        { errors: pathErrors }
+      ));
+    }
+
+    // Path policy failures are always blocking. They protect fresh-copy isolation
+    // and should not be softened by command failure policy settings.
+    let stopped = pathErrors.length > 0 ||
+      (hasBlockingFailure(steps) && config.failurePolicy.stopOnFirstCommandFailure);
+
+    if (!stopped) {
+      const requiredFiles = await runRequiredFiles(config, verificationRoot);
+      steps.push(requiredFiles);
+      stopped = requiredFiles.status === "failed" && config.failurePolicy.stopOnFirstCommandFailure;
+    }
 
     if (!stopped) {
       shouldRunAfterVerifyHooks = true;
@@ -213,7 +315,13 @@ export async function runVerification(
     if (flowPhaseStarted && needsApp && config.app) {
       const startCommand = normalizeStartCommand(config.commands);
       if (startCommand) {
-        server = await startManagedProcess(startCommand, verificationRoot, store, config.env);
+        server = await startManagedProcess(
+          startCommand,
+          verificationRoot,
+          store,
+          config.env,
+          verificationWorkspaceRoot
+        );
         artifacts.push(...server.artifacts);
         await waitForUrl(config.app.url, config.app.readyTimeoutMs, config.app.readyText, server.process);
       }
@@ -225,7 +333,7 @@ export async function runVerification(
         if (flow.kind === "browser") {
           steps.push(await runBrowserFlow(flow, config, verificationRoot, store));
         } else if (flow.kind === "cli") {
-          steps.push(await runCliFlow(flow, verificationRoot, store, config.env));
+          steps.push(await runCliFlow(flow, verificationRoot, store, config.env, verificationWorkspaceRoot));
         } else if (flow.kind === "api") {
           steps.push(await runApiFlow(flow, config.app?.url));
         } else if (flow.kind === "file") {

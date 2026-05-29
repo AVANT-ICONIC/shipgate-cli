@@ -4,6 +4,7 @@ import { execaCommand } from "execa";
 import type { CommandStepConfig, StepResult } from "../config/schema.js";
 import type { ArtifactStore } from "./artifactStore.js";
 import { durationMs, nowIso } from "../utils/time.js";
+import { resolveLocalPath } from "../utils/pathSafety.js";
 
 const ansiEscape = new RegExp(`${String.fromCharCode(27)}(?:\\[[0-?]*[ -/]*[@-~]|[@-_])`, "g");
 
@@ -34,8 +35,9 @@ export async function runCommandStep(
   step: CommandStepConfig,
   cwd: string,
   store: ArtifactStore,
-  inheritedEnv: Record<string, string> = {}
-): Promise<StepResult> {
+  inheritedEnv: Record<string, string> = {},
+  allowedCwdRoot = cwd
+): Promise<StepResult & { rawStdout: string; rawStderr: string }> {
   const startedAt = nowIso();
   const start = Date.now();
   const safeId = id.replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
@@ -46,13 +48,19 @@ export async function runCommandStep(
   let stderr = "";
   let exitCode: number | null = null;
   let errorMessage: string | undefined;
+  let resolvedCwd = cwd;
 
-  await writeFile(stdoutPath, "", "utf8");
-  await writeFile(stderrPath, "", "utf8");
+  if (store.logsEnabled) {
+    await writeFile(stdoutPath, "", "utf8");
+    await writeFile(stderrPath, "", "utf8");
+  }
 
   try {
+    resolvedCwd = step.cwd
+      ? resolveLocalPath(cwd, step.cwd, `${step.name} cwd`, allowedCwdRoot)
+      : cwd;
     const child = execaCommand(step.command, {
-      cwd: step.cwd ? path.resolve(cwd, step.cwd) : cwd,
+      cwd: resolvedCwd,
       shell: true,
       reject: false,
       timeout: step.timeoutMs ?? 120000,
@@ -77,8 +85,10 @@ export async function runCommandStep(
     stderr = outputFromError(error, "stderr");
   }
 
-  await writeFile(stdoutPath, stdout, "utf8");
-  await writeFile(stderrPath, stderr, "utf8");
+  if (store.logsEnabled) {
+    await writeFile(stdoutPath, stdout, "utf8");
+    await writeFile(stderrPath, stderr, "utf8");
+  }
 
   const status = exitCode === 0 && !errorMessage ? "passed" : "failed";
 
@@ -92,14 +102,25 @@ export async function runCommandStep(
     endedAt: nowIso(),
     durationMs: durationMs(start),
     command: step.command,
-    cwd: step.cwd ? path.resolve(cwd, step.cwd) : cwd,
+    cwd: resolvedCwd,
     exitCode,
     stdoutExcerpt: excerpt(stdout),
     stderrExcerpt: excerpt(stderr),
     error: errorMessage,
-    artifacts: [
+    artifacts: store.logsEnabled ? [
       { kind: "log", label: `${step.name} stdout`, path: stdoutPath },
       { kind: "log", label: `${step.name} stderr`, path: stderrPath }
-    ]
+    ] : [],
+    rawStdout: stdout,
+    rawStderr: stderr
   };
+}
+
+export function stripRawCommandOutput(
+  result: StepResult & { rawStdout: string; rawStderr: string }
+): StepResult {
+  const copy = { ...result } as StepResult & Partial<{ rawStdout: string; rawStderr: string }>;
+  delete copy.rawStdout;
+  delete copy.rawStderr;
+  return copy;
 }

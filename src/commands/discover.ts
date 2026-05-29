@@ -18,6 +18,7 @@ import {
   type ScreenshotComparison
 } from "../discovery/screenshotBaseline.js";
 import { logger } from "../utils/logger.js";
+import { resolveLocalPath } from "../utils/pathSafety.js";
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -187,6 +188,17 @@ export function registerDiscoverCommand(program: Command): void {
       if (!url) {
         throw new Error("No URL provided and config.app.url is missing.");
       }
+      const out = options.out ?? loaded.config.discovery.outputSpec;
+      const outPath = resolveLocalPath(
+        projectRoot,
+        out,
+        options.out ? "--out" : "discovery.outputSpec"
+      );
+      const screenshotBaselineDir = resolveLocalPath(
+        projectRoot,
+        loaded.config.discovery.screenshotBaselineDir,
+        "discovery.screenshotBaselineDir"
+      );
 
       const { chromium } = await import("playwright");
       const browser = await chromium.launch({ headless: true });
@@ -220,7 +232,7 @@ export function registerDiscoverCommand(program: Command): void {
           });
           const comparisons = await runScreenshotBaseline(page, crawlResult.routes, {
             projectRoot,
-            screenshotDir: loaded.config.discovery.screenshotBaselineDir,
+            screenshotDir: screenshotBaselineDir,
             mode: screenshotBaselineMode
           });
 
@@ -233,8 +245,6 @@ export function registerDiscoverCommand(program: Command): void {
         }
       })();
 
-      const out = options.out ?? loaded.config.discovery.outputSpec;
-      const outPath = path.isAbsolute(out) ? out : path.join(projectRoot, out);
       const formInteractions = makeSafeFormInteractions(result.routes, loaded.config.discovery.denyTextPatterns, formMode);
       await mkdir(path.dirname(outPath), { recursive: true });
       await writeFile(outPath, makeDiscoverySpec(result.startUrl, result.routes, loaded.config.discovery.denyTextPatterns, formMode), "utf8");
@@ -251,9 +261,7 @@ export function registerDiscoverCommand(program: Command): void {
         formMode,
         accessibilityScan,
         screenshotBaselineMode,
-        screenshotBaselineDir: path.isAbsolute(loaded.config.discovery.screenshotBaselineDir)
-          ? loaded.config.discovery.screenshotBaselineDir
-          : path.join(projectRoot, loaded.config.discovery.screenshotBaselineDir),
+        screenshotBaselineDir,
         crawledRoutes: result.routes.map((route) => ({
           url: route.url,
           path: route.path,

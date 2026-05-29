@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -277,6 +277,93 @@ describe("fixture verification", () => {
         url: `${appUrl}/health`,
         status: 200
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks verification paths that escape the project or workspace", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "shipgate-integration-path-policy-"));
+
+    try {
+      await writeFile(path.join(root, "README.md"), "# Path policy\n", "utf8");
+      await writeFile(path.join(root, "package.json"), "{}\n", "utf8");
+      const config = shipGateConfigSchema.parse({
+        profile: "generic",
+        packageManager: "npm",
+        commands: {
+          test: {
+            name: "escaped cwd",
+            command: "node -e \"console.log('should not run')\"",
+            cwd: ".."
+          }
+        },
+        flows: [
+          {
+            name: "escaped file",
+            kind: "file",
+            path: "../outside.txt"
+          }
+        ],
+        requiredFiles: ["../outside.txt"],
+        artifacts: {
+          dir: "../outside-artifacts"
+        },
+        failurePolicy: {
+          stopOnFirstCommandFailure: false
+        }
+      });
+
+      const result = await runVerification(root, config);
+
+      expect(result.status).toBe("failed");
+      expect(result.steps.map((step) => step.id)).toEqual(["preflight:path-policy"]);
+      expect(result.steps[0]?.error).toContain("requiredFiles entry \"../outside.txt\" must resolve inside");
+      expect(result.steps[0]?.error).toContain("commands.escaped cwd.cwd must resolve inside");
+      expect(result.steps[0]?.error).toContain("file flow \"escaped file\" path must resolve inside");
+      expect(result.steps[0]?.error).toContain("artifacts.dir must resolve inside");
+      expect(existsSync(path.join(root, ".shipgate", "latest-repair-prompt.md"))).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows command cwd movement inside a configured workspace root", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "shipgate-integration-workspace-cwd-"));
+    const appRoot = path.join(root, "packages", "app");
+
+    try {
+      await mkdir(appRoot, { recursive: true });
+      await writeFile(path.join(root, "workspace-marker.txt"), "workspace\n", "utf8");
+      await writeFile(path.join(appRoot, "README.md"), "# Workspace cwd\n", "utf8");
+      await writeFile(path.join(appRoot, "package.json"), "{}\n", "utf8");
+
+      const config = shipGateConfigSchema.parse({
+        profile: "generic",
+        packageManager: "npm",
+        workspace: {
+          root: "../.."
+        },
+        commands: {
+          test: {
+            name: "workspace command",
+            command: "node -e \"const fs=require('node:fs'); if (!fs.existsSync('workspace-marker.txt')) process.exit(1);\"",
+            cwd: "../.."
+          }
+        },
+        requiredFiles: ["README.md", "package.json"]
+      });
+
+      const result = await runVerification(appRoot, config, {
+        configDir: appRoot
+      });
+
+      expect(result.status).toBe("passed");
+      expect(result.steps.map((step) => step.id)).toEqual([
+        "preflight:required-files",
+        "workspace command"
+      ]);
+      expect(result.steps.find((step) => step.id === "workspace command")?.cwd).toBe(root);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

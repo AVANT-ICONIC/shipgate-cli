@@ -1,6 +1,6 @@
 {
   "name": "@shipgate/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "packageManager": "pnpm@10.17.0",
   "description": "A local-first verification gate for AI-built projects.",
   "license": "AGPL-3.0-or-later",
@@ -26,6 +26,7 @@
     "dist",
     "docs",
     "examples/ci",
+    "install.sh",
     "README.md",
     "LICENSE"
   ],
@@ -37,7 +38,8 @@
     "test:watch": "vitest",
     "lint": "eslint . --ext .ts",
     "format": "prettier --write .",
-    "verify:self": "pnpm build && node dist/cli.js doctor"
+    "verify:self": "pnpm build && node dist/cli.js doctor",
+    "release:github": "node scripts/release-github.mjs"
   },
   "dependencies": {
     "@axe-core/playwright": "^4.11.3",

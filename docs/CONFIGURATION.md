@@ -77,6 +77,10 @@ Built-in verification command order:
 
 `start` is used only as a managed app process for browser and API flows.
 
+`cwd` is optional. It is resolved relative to the verified project directory.
+For monorepos, it may point anywhere inside `workspace.root`, but it cannot
+escape the copied workspace.
+
 ## Hooks
 
 Hooks use the same object shape as command steps.
@@ -144,7 +148,8 @@ flows: [
 ]
 ```
 
-ShipGate captures screenshots and traces for browser flows.
+ShipGate captures screenshots and traces for browser flows unless disabled in
+`artifacts`.
 
 ## API Flows
 
@@ -217,6 +222,40 @@ File flows verify generated artifacts:
 ```
 
 Use `exists: false` when a file must not be present.
+
+## Path Policy
+
+Config-controlled local paths must be relative. ShipGate rejects absolute paths,
+null bytes, and `..` escapes before running commands.
+
+| Path field | Allowed boundary |
+| --- | --- |
+| `requiredFiles[]` | Project directory |
+| File flow `path` | Project directory |
+| `artifacts.dir` | Project directory |
+| `discovery.outputSpec` | Project directory |
+| `discovery.screenshotBaselineDir` | Project directory |
+| Command `cwd` | Configured workspace root |
+
+This keeps `shipgate verify --fresh` honest: commands and file checks run
+against the copied workspace, not files outside it.
+
+## Artifacts
+
+Artifact settings control where captured logs, screenshots, and traces are
+written:
+
+```ts
+artifacts: {
+  dir: ".shipgate/artifacts",
+  logs: true,
+  screenshots: true,
+  traces: true
+}
+```
+
+`dir` is relative to the project directory. Reports, latest result JSON, and
+repair prompts stay under `.shipgate` so agents and CI have stable paths.
 
 ## Monorepos
 

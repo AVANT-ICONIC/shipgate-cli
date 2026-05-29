@@ -10,13 +10,14 @@ import { registerDiscoverCommand } from "./commands/discover.js";
 import { registerSchemaCommand } from "./commands/schema.js";
 import { registerMcpCommand } from "./commands/mcp.js";
 import { registerViewReportCommand } from "./commands/viewReport.js";
+import { registerUpdateCommand } from "./commands/update.js";
 
 const program = new Command();
 
 program
   .name("shipgate")
   .description("A local-first verification gate for AI-built projects.")
-  .version("0.1.0");
+  .version("0.1.1");
 
 registerInitCommand(program);
 registerVerifyCommand(program);
@@ -28,6 +29,7 @@ registerSchemaCommand(program);
 registerDiscoverCommand(program);
 registerMcpCommand(program);
 registerViewReportCommand(program);
+registerUpdateCommand(program);
 
 program.parseAsync(process.argv).catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
