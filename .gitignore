@@ -11,3 +11,7 @@ coverage
 .env.*
 *.log
 .DS_Store
+
+# Avant Radar scan scratch. Untracked and not ignored, it reads as
+# uncommitted work and blocks every automated fast-forward of this checkout.
+.avant-radar/
