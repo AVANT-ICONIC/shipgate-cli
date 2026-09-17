@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, symlinkSync, readlinkSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -133,6 +133,39 @@ describe("fresh copy of a git repository", () => {
     expect(copy.hasGit).toBe(false);
     expect(existsSync(path.join(copy.tempRoot, "package.json"))).toBe(true);
     expect(existsSync(path.join(copy.tempRoot, "node_modules"))).toBe(false);
+    await copy.cleanup();
+    await rm(dir, { recursive: true, force: true });
+  });
+});
+
+describe("fidelity of the copy", () => {
+  it("keeps the project's own remotes, not a path to the source directory", async () => {
+    // `git clone --local` points origin at the source DIRECTORY. A project that
+    // checks where its code would survive from reads that as a local-only
+    // remote and is right to fail.
+    const dir = gitFixture();
+    spawnSync("git", ["-C", dir, "remote", "add", "origin", "https://example.com/project.git"], { encoding: "utf8" });
+    const copy = await createFreshCopy(dir);
+    const remotes = spawnSync("git", ["-C", copy.tempRoot, "remote", "-v"], { encoding: "utf8" });
+    expect(remotes.stdout).toContain("https://example.com/project.git");
+    expect(remotes.stdout).not.toContain(dir);
+    await copy.cleanup();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("copies a relative symlink as the relative symlink it was", async () => {
+    // Node's cp resolves relative symlinks to absolute paths unless told not
+    // to, so the copy would carry a link to a path on the machine it was made
+    // on, which is not what the repository contains.
+    const dir = gitFixture();
+    mkdirSync(path.join(dir, "a"), { recursive: true });
+    mkdirSync(path.join(dir, "b"), { recursive: true });
+    writeFileSync(path.join(dir, "b", "real.json"), "{}");
+    symlinkSync(path.join("..", "b", "real.json"), path.join(dir, "a", "link.json"));
+    const copy = await createFreshCopy(dir);
+    const target = readlinkSync(path.join(copy.tempRoot, "a", "link.json"));
+    expect(target).toBe(path.join("..", "b", "real.json"));
+    expect(path.isAbsolute(target)).toBe(false);
     await copy.cleanup();
     await rm(dir, { recursive: true, force: true });
   });

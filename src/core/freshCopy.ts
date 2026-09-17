@@ -130,7 +130,34 @@ function seedGitRepository(projectRoot: string, tempRoot: string): boolean {
   // The working tree is copied in separately; this only makes the index agree
   // with HEAD, so tracked files read as tracked instead of as untracked.
   const readTree = spawnSync("git", ["-C", tempRoot, "read-tree", "HEAD"], { stdio: "ignore" });
-  return readTree.status === 0;
+  if (readTree.status !== 0) return false;
+
+  // THE COPY'S REMOTES MUST BE THE PROJECT'S REMOTES.
+  //
+  // `git clone --local` points origin at the source DIRECTORY, so the copy's
+  // origin is a path on this machine. A project that checks where its own code
+  // would survive from reads that as a local-only remote and is right to fail:
+  // apex-nexus asserts exactly that, in
+  // "the vendored harness is not its own git -- it rides this repository's
+  // origin", because its fleet scripts survive a dead Mac only through an
+  // off-disk origin.
+  //
+  // A fresh clone of the project has the project's remotes. This makes that
+  // true. It stays a copy: no fetch, no push, nothing is contacted.
+  const remotes = git(projectRoot, ["remote", "-v"]);
+  if (remotes.ok) {
+    spawnSync("git", ["-C", tempRoot, "remote", "remove", "origin"], { stdio: "ignore" });
+    const seen = new Set<string>();
+    for (const line of remotes.stdout.split("\n")) {
+      const match = /^(\S+)\s+(\S+)\s+\(fetch\)$/.exec(line.trim());
+      const name = match?.[1];
+      const url = match?.[2];
+      if (!name || !url || seen.has(name)) continue;
+      seen.add(name);
+      spawnSync("git", ["-C", tempRoot, "remote", "add", name, url], { stdio: "ignore" });
+    }
+  }
+  return true;
 }
 
 export type FreshCopyResult = {
@@ -157,6 +184,16 @@ export async function createFreshCopy(
   await cp(projectRoot, tempRoot, {
     recursive: true,
     force: true,
+    // A SYMLINK MUST ARRIVE AS THE SYMLINK IT WAS.
+    //
+    // Node's cp resolves relative symlinks to absolute paths unless told not
+    // to. A repository that links one vendored file to its sibling copy gets a
+    // link to an absolute path on the machine the copy was made on, which is
+    // not what the repository contains and does not survive being moved.
+    // apex-nexus fails on exactly that: "pool-registry.json links to
+    // /Users/.../ops/fleet/queue-ceo/pool-registry.json, which is not a
+    // relative path into a sibling fleet directory".
+    verbatimSymlinks: true,
     filter: (source) => {
       const relativePath = path.relative(projectRoot, source);
       if (ignored.has(normalize(relativePath))) return false;
