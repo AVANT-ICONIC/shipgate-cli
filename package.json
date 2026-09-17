@@ -33,6 +33,7 @@
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsup src/cli.ts src/index.ts --format esm --dts --clean --sourcemap",
+    "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
