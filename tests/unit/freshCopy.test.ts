@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -44,6 +45,94 @@ describe("fresh copy", () => {
     expect(existsSync(path.join(copy.tempRoot, "packages", "app", "node_modules"))).toBe(false);
     expect(existsSync(path.join(copy.tempRoot, "packages", "app", "dist"))).toBe(false);
     expect(existsSync(path.join(copy.tempRoot, "packages", "app", ".shipgate", "artifacts"))).toBe(false);
+    await copy.cleanup();
+    await rm(dir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A FRESH COPY OF A REPOSITORY IS STILL A REPOSITORY.
+
+function gitFixture(): string {
+  const dir = path.join(tmpdir(), `shipgate-git-test-${Date.now()}-${Math.random()}`);
+  mkdirSync(dir, { recursive: true });
+  const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  git("init", "-q");
+  git("config", "user.email", "test@example.com");
+  git("config", "user.name", "test");
+  writeFileSync(path.join(dir, ".gitignore"), ".scratch/\nbuilt.js\n");
+  writeFileSync(path.join(dir, "package.json"), "{}");
+  writeFileSync(path.join(dir, "tracked.js"), "export const tracked = 1;\n");
+  mkdirSync(path.join(dir, ".scratch", "vendored"), { recursive: true });
+  writeFileSync(path.join(dir, ".scratch", "vendored", "theirs.js"), "export const theirs = 1;\n");
+  writeFileSync(path.join(dir, "built.js"), "export const built = 1;\n");
+  git("add", ".gitignore", "package.json", "tracked.js");
+  git("commit", "-qm", "initial");
+  return dir;
+}
+
+describe("fresh copy of a git repository", () => {
+  it("carries a working .git, so checks that ask git anything get an answer", async () => {
+    // 25 of apex-nexus's tests failed here and passed everywhere else, because
+    // every one of them interrogates the repository and the copy had no .git.
+    const dir = gitFixture();
+    const copy = await createFreshCopy(dir);
+    expect(copy.hasGit).toBe(true);
+
+    const lsFiles = spawnSync("git", ["-C", copy.tempRoot, "ls-files"], { encoding: "utf8" });
+    expect(lsFiles.status).toBe(0);
+    expect(lsFiles.stdout).toContain("tracked.js");
+
+    const log = spawnSync("git", ["-C", copy.tempRoot, "log", "--oneline"], { encoding: "utf8" });
+    expect(log.status).toBe(0);
+    expect(log.stdout).toContain("initial");
+
+    await copy.cleanup();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("borrows the object store instead of copying it", async () => {
+    // apex-nexus's .git is 8.7 GB. Copying that per verify is not a thing
+    // anyone runs twice, so the clone is --shared and the objects are borrowed.
+    const dir = gitFixture();
+    const copy = await createFreshCopy(dir);
+    expect(existsSync(path.join(copy.tempRoot, ".git", "objects", "info", "alternates"))).toBe(true);
+    await copy.cleanup();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("leaves out what the project's own .gitignore excludes", async () => {
+    // The fresh copy ran 1,144 test files where apex-nexus has 988. The extra
+    // 156 came from a vendored checkout under a gitignored path.
+    const dir = gitFixture();
+    const copy = await createFreshCopy(dir);
+    expect(existsSync(path.join(copy.tempRoot, ".scratch"))).toBe(false);
+    expect(existsSync(path.join(copy.tempRoot, "built.js"))).toBe(false);
+    expect(existsSync(path.join(copy.tempRoot, "tracked.js"))).toBe(true);
+    await copy.cleanup();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("still copies an untracked file that git does not ignore", async () => {
+    // Untracked is not ignored. Work in progress is what a verification run
+    // exists to judge, and dropping it would make the gate go quiet exactly
+    // while a change is being made.
+    const dir = gitFixture();
+    writeFileSync(path.join(dir, "work-in-progress.js"), "export const wip = 1;\n");
+    const copy = await createFreshCopy(dir);
+    expect(existsSync(path.join(copy.tempRoot, "work-in-progress.js"))).toBe(true);
+    await copy.cleanup();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("a project that is not a repository copies exactly as it always did", async () => {
+    // Soft in every direction: no repository, no git, a clone that refuses for
+    // any reason at all. The copy is made without .git, and says so.
+    const dir = fixture();
+    const copy = await createFreshCopy(dir);
+    expect(copy.hasGit).toBe(false);
+    expect(existsSync(path.join(copy.tempRoot, "package.json"))).toBe(true);
+    expect(existsSync(path.join(copy.tempRoot, "node_modules"))).toBe(false);
     await copy.cleanup();
     await rm(dir, { recursive: true, force: true });
   });
