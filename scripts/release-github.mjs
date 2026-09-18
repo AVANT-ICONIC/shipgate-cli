@@ -32,6 +32,33 @@ async function run(command, env = process.env) {
 
 await mkdir(tmp, { recursive: true });
 await run("shipgate verify --fresh");
+
+// BUILD BEFORE PACKING, AND CHECK WHAT WAS BUILT.
+//
+// `npm pack` ships whatever `dist/` happens to be on disk, and `dist/` carries
+// the version that was in package.json when it was last built. `prepare` does
+// not save this: npm runs it for a git dependency and for a local install, not
+// for a tarball, so a tarball must arrive already correct.
+//
+// MEASURED 2026-09-18: v0.1.2 was cut by bumping the version and packing. The
+// tarball's package.json said 0.1.2 and its `dist/cli.js` answered 0.1.1.
+// apex-nexus's CI caught it only because that workflow asks the installed
+// binary its version instead of checking that a file exists:
+//
+//     ##[error]shipgate reports 0.1.1, expected 0.1.2
+//
+// Without that check it would have shipped a release whose contents were a
+// different build from its name.
+await run("npm run build");
+const built = await execaCommand("node dist/cli.js --version", { shell: true, reject: false });
+const reported = String(built.stdout ?? "").trim();
+if (reported !== version) {
+  throw new Error(
+    `the built CLI reports ${reported || "(nothing)"} but package.json says ${version}. ` +
+      "Packing this would publish a tarball whose contents are a different build from its name."
+  );
+}
+
 await run("npm pack --dry-run");
 await run(`npm pack --pack-destination ${JSON.stringify(tmp)}`);
 

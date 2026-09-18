@@ -4,6 +4,21 @@
 
 No unreleased changes.
 
+## 0.1.3 - 2026-09-18
+
+- The CLI reports the package's version instead of a literal. `src/cli.ts`
+  carried `.version("0.1.1")` beside a package.json that could say anything, so
+  v0.1.2 was tagged, packed and published with a `dist/cli.js` that still
+  answered 0.1.1: the release's name and its contents were different builds.
+  It was caught downstream by a consumer whose CI asks the installed binary its
+  version rather than checking that a file exists.
+- The release script builds before packing and refuses to pack a `dist/` whose
+  reported version disagrees with package.json. `npm pack` ships whatever is on
+  disk, and `prepare` does not save a tarball: npm runs it for a git dependency
+  and for a local install, never for a tarball, so a tarball has to arrive
+  already correct.
+- v0.1.2 is superseded. Its tarball installs a binary that answers 0.1.1.
+
 ## 0.1.2 - 2026-09-18
 
 - A fresh copy of a repository is now still a repository. `.git` was in the
