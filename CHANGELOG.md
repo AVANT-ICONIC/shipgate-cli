@@ -4,6 +4,22 @@
 
 No unreleased changes.
 
+## 0.1.2 - 2026-09-18
+
+- A fresh copy of a repository is now still a repository. `.git` was in the
+  default excludes, so every check that asks git failed in the fresh copy and
+  said only `fatal: not a git repository`. Measured in apex-nexus: 26 of its
+  tests failed that way and passed everywhere else. The copy now gets a `.git`
+  of a few kilobytes via `git clone --local --shared --no-checkout` plus
+  `read-tree`, borrowing the object store rather than copying it, because that
+  project's `.git` is 8.7 GB.
+- The fresh copy carries the project's remotes and its symlinks as written.
+- Installing from a git URL produces a working binary. The package declares a
+  `bin` and ships `dist/`, but had no `prepare` script, and `prepare` is the
+  only script npm runs for a git dependency. So `dist/` was never built, the bin
+  target did not exist, npm skipped the link in silence, and the install exited
+  0 with nothing to run.
+
 ## 0.1.1 - 2026-05-29
 
 - Added a pnpm lockfile, pinned pnpm version, and runnable ESLint flat configuration for TypeScript source checks.
