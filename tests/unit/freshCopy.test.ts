@@ -153,6 +153,41 @@ describe("fidelity of the copy", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("keeps the remote-tracking refs, so a check compares against the same base it would in the project", async () => {
+    // `git remote remove origin` takes `refs/remotes/origin/*` with it, and
+    // nothing here fetches them back. A check that asks what changed since the
+    // default branch then resolves `origin/main` in the project and something
+    // else -- the local branch, `HEAD^`, or nothing -- inside the copy, so the
+    // same command on the same commit answers differently under --fresh.
+    //
+    // The dangerous half is quieter: a guard that reads a file as the base
+    // branch has it (`git show origin/main:path`) gets nothing back and
+    // reports no violation. It fails OPEN. The run is green because the ref
+    // was missing, not because the file was unchanged.
+    const dir = gitFixture();
+    spawnSync("git", ["-C", dir, "remote", "add", "origin", "https://example.com/project.git"], { encoding: "utf8" });
+    const copy = await createFreshCopy(dir);
+
+    const head = spawnSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+    const branch = spawnSync("git", ["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"], {
+      encoding: "utf8",
+    }).stdout.trim();
+    const tracked = spawnSync("git", ["-C", copy.tempRoot, "rev-parse", `origin/${branch}`], {
+      encoding: "utf8",
+    });
+    expect(tracked.status).toBe(0);
+    expect(tracked.stdout.trim()).toBe(head);
+
+    // And the URL is still the project's, which is the reason the remote was
+    // touched at all.
+    const remotes = spawnSync("git", ["-C", copy.tempRoot, "remote", "-v"], { encoding: "utf8" });
+    expect(remotes.stdout).toContain("https://example.com/project.git");
+    expect(remotes.stdout).not.toContain(dir);
+
+    await copy.cleanup();
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("copies a relative symlink as the relative symlink it was", async () => {
     // Node's cp resolves relative symlinks to absolute paths unless told not
     // to, so the copy would carry a link to a path on the machine it was made

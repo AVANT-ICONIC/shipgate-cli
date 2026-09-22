@@ -144,9 +144,27 @@ function seedGitRepository(projectRoot: string, tempRoot: string): boolean {
   //
   // A fresh clone of the project has the project's remotes. This makes that
   // true. It stays a copy: no fetch, no push, nothing is contacted.
+  //
+  // REPOINT origin, NEVER REMOVE IT.
+  //
+  // `git remote remove origin` deletes `refs/remotes/origin/*` along with the
+  // remote. Since nothing here fetches, those refs never come back, and the
+  // copy loses every remote-tracking ref the clone had just given it.
+  //
+  // A check that asks what changed against the default branch then resolves a
+  // DIFFERENT ref inside the copy than it does in the project. In the project
+  // `origin/main` exists and wins; in the copy it is gone, so the check falls
+  // through to the local `main`, which may be behind, or to `HEAD^`, or to
+  // nothing. The same command on the same commit answers differently depending
+  // on whether it ran under --fresh. Worse, a guard that reads a file as the
+  // base branch has it (`git show origin/main:path`) gets no previous content
+  // and reports no violation: it fails OPEN, and the run is green because the
+  // ref was missing, not because the file was unchanged.
+  //
+  // `git remote set-url` changes the URL and keeps the refs. The copy keeps
+  // both facts: the project's remote, and the commits the clone already had.
   const remotes = git(projectRoot, ["remote", "-v"]);
   if (remotes.ok) {
-    spawnSync("git", ["-C", tempRoot, "remote", "remove", "origin"], { stdio: "ignore" });
     const seen = new Set<string>();
     for (const line of remotes.stdout.split("\n")) {
       const match = /^(\S+)\s+(\S+)\s+\(fetch\)$/.exec(line.trim());
@@ -154,7 +172,15 @@ function seedGitRepository(projectRoot: string, tempRoot: string): boolean {
       const url = match?.[2];
       if (!name || !url || seen.has(name)) continue;
       seen.add(name);
-      spawnSync("git", ["-C", tempRoot, "remote", "add", name, url], { stdio: "ignore" });
+      const repointed = spawnSync("git", ["-C", tempRoot, "remote", "set-url", name, url], {
+        stdio: "ignore",
+      });
+      // A remote the clone did not create (anything but origin) has no URL to
+      // set; add it. Adding creates no remote-tracking refs, and there were
+      // none to lose.
+      if (repointed.status !== 0) {
+        spawnSync("git", ["-C", tempRoot, "remote", "add", name, url], { stdio: "ignore" });
+      }
     }
   }
   return true;
