@@ -36,6 +36,9 @@ importers:
         specifier: ^3.24.1
         version: 3.25.76
     devDependencies:
+      '@avant-iconic/cleanroom':
+        specifier: github:AVANT-ICONIC/cleanroom#3da8cf6c73bce533e4d1b08e97b7e3992da31927
+        version: https://codeload.github.com/AVANT-ICONIC/cleanroom/tar.gz/3da8cf6c73bce533e4d1b08e97b7e3992da31927
       '@types/node':
         specifier: ^22.10.2
         version: 22.19.19
@@ -62,6 +65,12 @@ importers:
         version: 2.1.9(@types/node@22.19.19)
 
 packages:
+
+  '@avant-iconic/cleanroom@https://codeload.github.com/AVANT-ICONIC/cleanroom/tar.gz/3da8cf6c73bce533e4d1b08e97b7e3992da31927':
+    resolution: {tarball: https://codeload.github.com/AVANT-ICONIC/cleanroom/tar.gz/3da8cf6c73bce533e4d1b08e97b7e3992da31927}
+    version: 1.1.0
+    engines: {node: '>=20'}
+    hasBin: true
 
   '@axe-core/playwright@4.11.3':
     resolution: {integrity: sha512-h/kfksv4F0cVIDlKpT4700OehdRgpvuVskuQ2nb7/JmtWUXpe9ftHAPtwyXGvVSsa6SJ64A9ER7Zrzc/sIvC4w==}
@@ -1892,6 +1901,8 @@ packages:
     resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
 
 snapshots:
+
+  '@avant-iconic/cleanroom@https://codeload.github.com/AVANT-ICONIC/cleanroom/tar.gz/3da8cf6c73bce533e4d1b08e97b7e3992da31927': {}
 
   '@axe-core/playwright@4.11.3(playwright-core@1.60.0)':
     dependencies:

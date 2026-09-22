@@ -54,6 +54,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@avant-iconic/cleanroom": "github:AVANT-ICONIC/cleanroom#3da8cf6c73bce533e4d1b08e97b7e3992da31927",
     "@types/node": "^22.10.2",
     "eslint": "^9.17.0",
     "prettier": "^3.4.2",

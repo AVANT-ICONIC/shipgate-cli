@@ -21,13 +21,13 @@ node scripts/cleanroom-parity.mjs \
   --output /tmp/parity-manifest.json
 ```
 
-Ground-truth execution on the pinned Apex tree with Cleanroom `3da8cf6` produced:
+Ground-truth execution on the pinned Apex tree, on branch `master`, with Cleanroom `3da8cf6` produced:
 
-- `audit --json`: exit 0, 42 findings, 3 violations, entropy 12, SHA-256 `013c106d89b019bf1b7017a76b4bd8d225cf774cc3a89476edbd4d3978804f34`.
-- `providers --json`: exit 0, SHA-256 `bb502c98b6fcfc4574afa91b67c780760f1b1a9cf529136fadf6aced0aa4652d`.
-- `check --json`: exit 0, resolved compare ref `HEAD^`, SHA-256 `875e01a9cf60cc9f78c2b7d743e7abb306ea9ba8008134f9ceb44fa7d5df076d`.
+- `audit --json`: exit 0, 42 findings, 3 violations, entropy 12. The full-output digest is environment-sensitive and is evidence for this run, not a cross-machine invariant: `013c106d89b019bf1b7017a76b4bd8d225cf774cc3a89476edbd4d3978804f34`.
+- `providers --json`: exit 0. Availability is environment-sensitive; the exact status metadata for this run is committed as `../providers-status.json`. Full-output digest: `bb502c98b6fcfc4574afa91b67c780760f1b1a9cf529136fadf6aced0aa4652d`.
+- `check --json`: exit 0, resolved compare ref `HEAD^`, reproducible SHA-256 `875e01a9cf60cc9f78c2b7d743e7abb306ea9ba8008134f9ceb44fa7d5df076d`. A detached checkout of the same commit resolves no compare ref and falls back to the adoption baseline, so the branch is part of the evidence.
 - `test/apex-ground-truth.test.mjs`: 3/3 passed, covering the stranded tested-only implementation, unreachable implementation plus duplicated decision source, and private-symbol false-positive classes.
 
 The real old/new run starts after the ShipGate policy entry point exists. Until then, Step 0 tests exercise the harness with controlled executables and prove that semantic changes fail while the narrow volatile set passes.
 
-The required `shipgate verify --fresh` versus non-fresh Cleanroom integration case is frozen here but becomes executable in Step 4, when the policy is registered inside verification. It must assert identical resolved compare refs and findings before Step 5 begins.
+Step 0 now executes the legacy half of the required fresh-copy gate: it creates a repository with `origin/main`, runs legacy Cleanroom auto-resolution in the original and a ShipGate fresh copy, and requires identical compare refs and findings. Step 4 adds the same assertion through the registered ShipGate policy pack and must pass before Step 5.
