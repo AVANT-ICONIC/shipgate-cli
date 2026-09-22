@@ -168,7 +168,7 @@ export const cleanroomPolicyConfigSchema = z.object({
   enabled: z.boolean().default(false),
   configFile: safePolicyPathSchema.default(".shipgate/policies/cleanroom.json"),
   compareAgainst: z.union([z.literal("auto"), z.string().min(1)]).default("auto")
-}).default({});
+}).strict().default({});
 
 export const policiesConfigSchema = z.object({
   cleanroom: cleanroomPolicyConfigSchema

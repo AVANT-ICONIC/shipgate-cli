@@ -17,6 +17,10 @@ describe("policy configuration", () => {
     }
   );
 
+  it("rejects misspelled Cleanroom config keys instead of silently defaulting", () => {
+    expect(() => shipGateConfigSchema.parse({ policies: { cleanroom: { compareAgaints: "main" } } })).toThrow();
+  });
+
   it("rejects unknown policy IDs", () => {
     expect(() => shipGateConfigSchema.parse({ policies: { unknown: { enabled: true } } })).toThrow();
   });

@@ -33,6 +33,37 @@ describe("policy runner", () => {
     }
   );
 
+  it("fails closed when a module claims exit 0 with blocked status", async () => {
+    const module = { id: "contradictory", run: () => ({ exitCode: 0, status: "blocked", findings: [] }) } as unknown as PolicyModule<typeof context.config>;
+    const step = await runPolicy(module, context);
+    expect(step).toMatchObject({
+      status: "failed", exitCode: 2,
+      error: "Policy returned status blocked for exitCode 0; expected passed.",
+      details: { policyStatus: "invalid", rawResult: { exitCode: 0, status: "blocked", findings: [] } }
+    });
+  });
+
+  it("turns a thrown analyzer error into an invalid evidence-bearing step", async () => {
+    const module: PolicyModule<typeof context.config> = { id: "throwing", run: () => { throw new Error("analyzer crashed"); } };
+    const step = await runPolicy(module, context);
+    expect(step).toMatchObject({
+      status: "failed", exitCode: 2,
+      error: "Policy throwing threw: analyzer crashed",
+      details: { policyStatus: "invalid", findings: [] }
+    });
+  });
+
+  it("fails closed on an untyped result with invalid exitCode and findings", async () => {
+    const raw = { exitCode: undefined, findings: undefined };
+    const module = { id: "unchecked-js", run: () => raw } as unknown as PolicyModule<typeof context.config>;
+    const step = await runPolicy(module, context);
+    expect(step).toMatchObject({
+      status: "failed", exitCode: 2,
+      error: "Policy returned invalid exitCode: undefined. Expected 0, 1, or 2.",
+      details: { policyStatus: "invalid", rawResult: raw }
+    });
+  });
+
   it("represents a disabled policy as an explicit skipped step", () => {
     expect(disabledPolicyStep("example")).toMatchObject({
       id: "policy:example", kind: "policy", status: "skipped", exitCode: 0,
