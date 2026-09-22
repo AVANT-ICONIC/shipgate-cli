@@ -25,6 +25,7 @@ describe("shipGateJsonSchema", () => {
       "fresh",
       "failurePolicy",
       "discovery",
+      "policies",
       "env"
     ]);
     expect(shipGateJsonSchema.$defs.commandStep.required).toEqual(["name", "command"]);
@@ -35,6 +36,10 @@ describe("shipGateJsonSchema", () => {
     expect(shipGateJsonSchema.$defs.discovery.properties.screenshotBaselineMode.default).toBe("off");
     expect(shipGateJsonSchema.$defs.discovery.properties.screenshotBaselineDir.default).toBe(".shipgate/discovery-screenshots");
     expect(shipGateJsonSchema.$defs.discovery.properties.denyTextPatterns.default).toContain("destroy");
+    expect(shipGateJsonSchema.$defs.policies.additionalProperties).toBe(false);
+    expect(shipGateJsonSchema.$defs.cleanroomPolicy.properties.enabled.default).toBe(false);
+    expect(shipGateJsonSchema.$defs.cleanroomPolicy.properties.configFile.default)
+      .toBe(".shipgate/policies/cleanroom.json");
   });
 
   it("writes schema JSON through the CLI command", async () => {

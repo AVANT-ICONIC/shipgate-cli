@@ -53,6 +53,9 @@ export const shipGateJsonSchema = {
     discovery: {
       $ref: "#/$defs/discovery"
     },
+    policies: {
+      $ref: "#/$defs/policies"
+    },
     env: {
       $ref: "#/$defs/stringRecord",
       default: {}
@@ -501,6 +504,36 @@ export const shipGateJsonSchema = {
           type: "integer",
           minimum: 0,
           default: 20
+        }
+      },
+      default: {}
+    },
+    policies: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        cleanroom: {
+          $ref: "#/$defs/cleanroomPolicy"
+        }
+      },
+      default: {}
+    },
+    cleanroomPolicy: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        enabled: { type: "boolean", default: false },
+        configFile: {
+          type: "string",
+          minLength: 1,
+          pattern: String.raw`^(?![A-Za-z]:[\\/])(?![\\/])(?!.*(?:^|[\\/])\.\.(?:[\\/]|$)).+$`,
+          default: ".shipgate/policies/cleanroom.json",
+          description: "Project-relative Cleanroom policy configuration path."
+        },
+        compareAgainst: {
+          type: "string",
+          minLength: 1,
+          default: "auto"
         }
       },
       default: {}
