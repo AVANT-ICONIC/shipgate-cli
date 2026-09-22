@@ -28,7 +28,8 @@
     "examples/ci",
     "install.sh",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "dev": "tsx src/cli.ts",
