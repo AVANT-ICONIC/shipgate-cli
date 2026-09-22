@@ -1,0 +1,53 @@
+{
+  "apexCommit": "6f26921a05becbc71321aaf318da11085311575c",
+  "branch": "master",
+  "node": "v22.23.2",
+  "statuses": [
+    {
+      "provider": "fallow",
+      "status": "error",
+      "enabled": true,
+      "available": false,
+      "capabilities": [
+        "static-analysis",
+        "reachability",
+        "duplication",
+        "architecture",
+        "design-system"
+      ],
+      "command": null,
+      "errors": [
+        "fallow: spawnSync fallow EACCES"
+      ],
+      "findings": 0,
+      "sources": []
+    },
+    {
+      "provider": "knip",
+      "status": "disabled",
+      "enabled": false,
+      "available": false,
+      "capabilities": [
+        "reachability",
+        "unused-code",
+        "dependencies"
+      ],
+      "findings": 0
+    },
+    {
+      "provider": "project-native",
+      "status": "ok",
+      "enabled": true,
+      "available": true,
+      "capabilities": [
+        "project-native",
+        "code-graph",
+        "runtime-evidence"
+      ],
+      "command": null,
+      "errors": [],
+      "findings": 0,
+      "sources": []
+    }
+  ]
+}
