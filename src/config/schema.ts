@@ -156,6 +156,24 @@ export const discoveryConfigSchema = z.object({
   ])
 }).default({});
 
+
+const safePolicyPathSchema = z.string().min(1).refine((value) => {
+  const normalized = value.replace(/\\/g, "/");
+  return !normalized.startsWith("/")
+    && !/^[A-Za-z]:\//.test(normalized)
+    && !normalized.split("/").includes("..");
+}, "Policy config path must be relative and remain inside the project root");
+
+export const cleanroomPolicyConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  configFile: safePolicyPathSchema.default(".shipgate/policies/cleanroom.json"),
+  compareAgainst: z.union([z.literal("auto"), z.string().min(1)]).default("auto")
+}).default({});
+
+export const policiesConfigSchema = z.object({
+  cleanroom: cleanroomPolicyConfigSchema
+}).strict().default({});
+
 export const shipGateConfigSchema = z.object({
   profile: z.string().default("generic"),
   packageManager: z.enum(["npm", "pnpm", "yarn", "bun", "auto"]).default("auto"),
@@ -169,6 +187,7 @@ export const shipGateConfigSchema = z.object({
   fresh: freshConfigSchema,
   failurePolicy: failurePolicySchema,
   discovery: discoveryConfigSchema,
+  policies: policiesConfigSchema,
   env: z.record(z.string()).default({})
 });
 
@@ -182,6 +201,8 @@ export type CliFlow = z.infer<typeof cliFlowSchema>;
 export type ApiFlow = z.infer<typeof apiFlowSchema>;
 export type FileFlow = z.infer<typeof fileFlowSchema>;
 export type FlowConfig = z.infer<typeof flowSchema>;
+export type CleanroomPolicyConfig = z.infer<typeof cleanroomPolicyConfigSchema>;
+export type PoliciesConfig = z.infer<typeof policiesConfigSchema>;
 export type ShipGateConfig = z.infer<typeof shipGateConfigSchema>;
 export type ShipGateConfigInput = z.input<typeof shipGateConfigSchema>;
 
@@ -196,7 +217,7 @@ export type StepStatus = "passed" | "failed" | "skipped";
 export type StepResult = {
   id: string;
   name: string;
-  kind: "command" | "browser" | "api" | "file" | "preflight" | "discovery";
+  kind: "command" | "browser" | "api" | "file" | "preflight" | "discovery" | "policy";
   status: StepStatus;
   required: boolean;
   startedAt: string;
