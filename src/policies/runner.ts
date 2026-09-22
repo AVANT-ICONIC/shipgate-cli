@@ -37,7 +37,18 @@ function validateResult(value: unknown): PolicyResult {
       value
     );
   }
-  return { ...raw, exitCode: raw.exitCode, status: expectedStatus, findings: raw.findings } as PolicyResult;
+  const details = raw.details;
+  const plainDetails = details !== null
+    && typeof details === "object"
+    && !Array.isArray(details)
+    && (Object.getPrototypeOf(details) === Object.prototype || Object.getPrototypeOf(details) === null);
+  return {
+    ...raw,
+    exitCode: raw.exitCode,
+    status: expectedStatus,
+    findings: raw.findings,
+    details: plainDetails ? details as Record<string, unknown> : { rawDetails: details }
+  } as PolicyResult;
 }
 
 export function policyResultToStepResult(

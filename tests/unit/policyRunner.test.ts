@@ -64,6 +64,12 @@ describe("policy runner", () => {
     });
   });
 
+  it("keeps non-object details as rawDetails instead of spreading strings", async () => {
+    const module = { id: "details", run: () => ({ exitCode: 0, findings: [], details: "abc" }) } as unknown as PolicyModule<typeof context.config>;
+    const step = await runPolicy(module, context);
+    expect(step.details).toEqual({ policyStatus: "passed", findings: [], rawDetails: "abc" });
+  });
+
   it("represents a disabled policy as an explicit skipped step", () => {
     expect(disabledPolicyStep("example")).toMatchObject({
       id: "policy:example", kind: "policy", status: "skipped", exitCode: 0,

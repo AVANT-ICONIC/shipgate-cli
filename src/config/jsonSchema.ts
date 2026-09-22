@@ -526,7 +526,7 @@ export const shipGateJsonSchema = {
         configFile: {
           type: "string",
           minLength: 1,
-          pattern: "^(?![A-Za-z]:[\\/])(?![\\/])(?!.*(?:^|[\\/])\.\.(?:[\\/]|$)).+$",
+          pattern: String.raw`^(?![A-Za-z]:[\\/])(?![\\/])(?!.*(?:^|[\\/])\.\.(?:[\\/]|$)).+$`,
           default: ".shipgate/policies/cleanroom.json",
           description: "Project-relative Cleanroom policy configuration path."
         },
