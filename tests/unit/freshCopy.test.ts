@@ -125,6 +125,30 @@ describe("fresh copy of a git repository", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("copies a file git tracks even under a default-excluded name, and nothing untracked beside it", async () => {
+    // apex-nexus tracks graft/.cache/wiring-stamp.json; the `.cache` default
+    // dropped it and two of its tests failed under --fresh and nowhere else.
+    const dir = gitFixture();
+    const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+    mkdirSync(path.join(dir, "graft", ".cache"), { recursive: true });
+    writeFileSync(path.join(dir, "graft", ".cache", "wiring-stamp.json"), "{}\n");
+    git("add", "graft/.cache/wiring-stamp.json");
+    git("commit", "-qm", "stamp");
+    writeFileSync(path.join(dir, "graft", ".cache", "untracked-scratch.bin"), "nope");
+    mkdirSync(path.join(dir, "other", ".cache"), { recursive: true });
+    writeFileSync(path.join(dir, "other", ".cache", "x.json"), "nope");
+    const copy = await createFreshCopy(dir);
+    expect(existsSync(path.join(copy.tempRoot, "graft", ".cache", "wiring-stamp.json"))).toBe(true);
+    expect(existsSync(path.join(copy.tempRoot, "graft", ".cache", "untracked-scratch.bin"))).toBe(false);
+    expect(existsSync(path.join(copy.tempRoot, "other", ".cache"))).toBe(false);
+    await copy.cleanup();
+    // An explicit fresh.exclude still wins over tracking.
+    const narrowed = await createFreshCopy(dir, ["graft"]);
+    expect(existsSync(path.join(narrowed.tempRoot, "graft"))).toBe(false);
+    await narrowed.cleanup();
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("a project that is not a repository copies exactly as it always did", async () => {
     // Soft in every direction: no repository, no git, a clone that refuses for
     // any reason at all. The copy is made without .git, and says so.

@@ -35,13 +35,52 @@ function matchesPattern(rel: string, pattern: string): boolean {
     rel.includes(`/${pattern}/`);
 }
 
-function shouldExclude(relativePath: string, extraExcludes: string[]): boolean {
+// Never copied, even when git tracks them: the repository itself (seeded
+// separately), ShipGate's own output, and secrets.
+const NEVER_COPIED = [".git", ".shipgate", ".env", ".env.*"];
+
+function shouldExclude(relativePath: string, extraExcludes: string[], tracked?: TrackedPaths): boolean {
   const rel = normalize(relativePath);
   if (!rel) return false;
 
-  const all = [...DEFAULT_EXCLUDES, ...extraExcludes].map(normalize);
+  if (extraExcludes.map(normalize).some((pattern) => matchesPattern(rel, pattern))) return true;
+  if (NEVER_COPIED.some((pattern) => matchesPattern(rel, pattern))) return true;
+  // A TRACKED PATH IS THE PROJECT, whatever its directory is called. The
+  // default list guesses at build output and caches by name; git knows.
+  if (tracked && (tracked.files.has(rel) || tracked.dirs.has(rel))) return false;
+  return DEFAULT_EXCLUDES.map(normalize).some((pattern) => matchesPattern(rel, pattern));
+}
 
-  return all.some((pattern) => matchesPattern(rel, pattern));
+type TrackedPaths = { files: Set<string>; dirs: Set<string> };
+
+/**
+ * Every file git tracks, and every directory that holds one.
+ *
+ * WHY. DEFAULT_EXCLUDES drops paths by NAME, and a name is a guess: `.cache`
+ * is usually a cache, but not always. MEASURED 2026-09-27 in apex-nexus: it
+ * tracks `graft/.cache/wiring-stamp.json` (its code-graph tool's wiring stamp,
+ * which a hook reads), the fresh copy dropped it, and two of its tests failed
+ * under --fresh and passed everywhere else. What git tracks is source by
+ * definition, so it is copied; untracked files under such a name are still
+ * excluded, and an explicit `fresh.exclude` still wins. Outside a repository
+ * this is empty and the copy behaves as it always did.
+ */
+export function gitTrackedPaths(projectRoot: string): TrackedPaths {
+  const files = new Set<string>();
+  const dirs = new Set<string>();
+  const { ok, stdout } = git(projectRoot, ["ls-files", "-z"]);
+  if (!ok) return { files, dirs };
+  for (const entry of stdout.split("\0")) {
+    const rel = normalize(entry);
+    if (!rel) continue;
+    files.add(rel);
+    for (let i = rel.lastIndexOf("/"); i > 0; i = rel.lastIndexOf("/", i - 1)) {
+      const dir = rel.slice(0, i);
+      if (dirs.has(dir)) break;
+      dirs.add(dir);
+    }
+  }
+  return { files, dirs };
 }
 
 function git(cwd: string, args: string[]): { ok: boolean; stdout: string } {
@@ -206,6 +245,7 @@ export async function createFreshCopy(
   // untracked file that git does NOT ignore is still copied: work in progress
   // is what a verification run exists to judge.
   const ignored = gitIgnoredPaths(projectRoot);
+  const tracked = gitTrackedPaths(projectRoot);
 
   await cp(projectRoot, tempRoot, {
     recursive: true,
@@ -223,7 +263,7 @@ export async function createFreshCopy(
     filter: (source) => {
       const relativePath = path.relative(projectRoot, source);
       if (ignored.has(normalize(relativePath))) return false;
-      return !shouldExclude(relativePath, extraExcludes);
+      return !shouldExclude(relativePath, extraExcludes, tracked);
     }
   });
 
