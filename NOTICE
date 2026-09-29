@@ -1,0 +1,10 @@
+# Provenance notices
+
+## Cleanroom policy pack
+
+The files under `src/policies/cleanroom/**/*.mjs` were ported from
+`AVANT-ICONIC/cleanroom` commit `3da8cf6c73bce533e4d1b08e97b7e3992da31927`.
+Marc Ettl, the sole copyright holder, approved their relicensing from
+AGPL-3.0-only to AGPL-3.0-or-later for inclusion in ShipGate. Each ported file
+carries the SPDX identifier `AGPL-3.0-or-later`. The standalone Cleanroom
+repository and its 1.1.x releases remain AGPL-3.0-only.
