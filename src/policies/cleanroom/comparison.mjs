@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { exists } from './lib/fs.mjs';
+import { resolveConfigPath, resolveStatePath } from './paths.ts';
 
 function git(root, args, { quiet = true } = {}) {
   try {
@@ -58,5 +59,5 @@ export function withRefWorktree(root, ref, fn) {
 }
 
 export function refHasGreenRoom(root) {
-  return exists(path.join(root, '.greenroom.json')) && exists(path.join(root, '.greenroom', 'baseline.json'));
+  return exists(resolveConfigPath(root)) && exists(resolveStatePath(root, '.greenroom/baseline.json'));
 }

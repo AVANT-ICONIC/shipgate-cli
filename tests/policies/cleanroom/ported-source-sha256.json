@@ -40,5 +40,51 @@
     "scanner.mjs": "8742e645e829ca58130bb36960db96514c3a5c0c464896770fde15af1cb8eb34",
     "violations.mjs": "4cd4359273dcee72dc63cdc6f967dca5c8463ebc491a8354c3afcfd88f804dac",
     "waivers.mjs": "1f90726942118b05426c04de02906d38c19737e9addff2155bd3e6b6e8230f8a"
+  },
+  "adaptations": {
+    "analyzers/generated.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "6cfb98ed02e16c5514846bb4435a46051788b1eaa6e486f8aba1bf21dcc07387"
+    },
+    "analyzers/registry.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "ed8c1356e1c7c08197f0bef6499a5c1c3f0d830860d645a199daa34d19a0c346"
+    },
+    "baseline.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "9ccdc204f63d5cc88f5335ee0c09c98247331138c13a0236c1faeed886267504"
+    },
+    "comparison.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "634e5e78adda77fd4858ecf1cafc063eea0734ae42fe4453d66ba1147007e1d5"
+    },
+    "config.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "9f7f6d1eec1bd2c046daeb3bdd4d19960036562996b630f65e06d16e7f7a806d"
+    },
+    "init.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "3a1bd54e6d6824b53a03635f854d0df39e14eef9ea6d53ac21ef924c2f554b02"
+    },
+    "integrity.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "41848dc1d89255cb679649db986576f732385fd8ffb5c338742d0282efdcef97"
+    },
+    "plan.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "3dbfe9c406264ff0c521a93c92dedc1591dca8ef4af784e8fcc2a49b2aae406b"
+    },
+    "providers/project-native.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "ab3f8e27ba4adbc8a7139e39ea3189e403701ac259f28c18e591c3ace3dbd6a1"
+    },
+    "register.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "e35419e8d5c2f12b7968d2babb75246fa31726e8c3705f14838d26ff06506555"
+    },
+    "waivers.mjs": {
+      "step": "step-3-dual-mode-state-paths",
+      "sha256": "818c40fea4ed7abf6ac245da4ecf74a5183f31860db97a63ece75ac0bfe1d915"
+    }
   }
 }

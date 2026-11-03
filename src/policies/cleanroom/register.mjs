@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { loadRegistry } from './analyzers/registry.mjs';
 import { writeJson, isSafeRelativePath, exists } from './lib/fs.mjs';
+import { resolveStatePath } from './paths.ts';
 
 export function registerCanonical(root, config, kind, name, canonical, aliases = [], { allowMissing = false, metadata = {} } = {}) {
   if (!['responsibility', 'component'].includes(kind)) throw new Error('kind must be responsibility or component');
@@ -20,6 +21,6 @@ export function registerCanonical(root, config, kind, name, canonical, aliases =
     }
   }
   registry[bucket][name] = clean;
-  writeJson(path.join(root, config.registryFile), registry);
+  writeJson(resolveStatePath(root, config.registryFile), registry);
   return registry[bucket][name];
 }

@@ -3,6 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { sha, exists } from './lib/fs.mjs';
+import { resolveStatePath, stateRelCandidates } from './paths.ts';
 import { loadConfig } from './config.mjs';
 import { loadRegistry } from './analyzers/registry.mjs';
 import { loadGeneratedRegistry } from './analyzers/generated.mjs';
@@ -29,12 +30,26 @@ function git(root, args) {
   catch { return null; }
 }
 
+/**
+ * Read a state file as a base ref has it. The current layout's path wins; a
+ * base from before a migration still carries the legacy path, and a lossless
+ * migration copies bytes unchanged, so both layouts are valid sources for the
+ * same logical file.
+ */
+function gitShowState(root, rel, base) {
+  for (const candidate of stateRelCandidates(root, rel)) {
+    let previous = git(root, ['show', `${base}:${candidate}`]);
+    if (previous == null && !String(base).startsWith('origin/')) previous = git(root, ['show', `origin/${base}:${candidate}`]);
+    if (previous != null) return previous;
+  }
+  return null;
+}
+
 function compareTrackedFile(root, rel, base, rule, message, allowKind) {
   if (!base || governanceAllowed(allowKind)) return null;
-  const currentPath = path.join(root, rel);
+  const currentPath = resolveStatePath(root, rel);
   const current = fs.existsSync(currentPath) ? fs.readFileSync(currentPath, 'utf8').trim() : null;
-  let previous = git(root, ['show', `${base}:${rel}`]);
-  if (previous == null && !String(base).startsWith('origin/')) previous = git(root, ['show', `origin/${base}:${rel}`]);
+  let previous = gitShowState(root, rel, base);
   if (previous != null) previous = previous.trim();
   if (previous !== null && previous !== current) return violation(rule, [rel], message.replace('{base}', base), base);
   return null;
@@ -46,9 +61,7 @@ function compareTrackedFile(root, rel, base, rule, message, allowKind) {
  */
 function textAtBase(root, rel, base) {
   if (!base) return null;
-  let previous = git(root, ['show', `${base}:${rel}`]);
-  if (previous == null && !String(base).startsWith('origin/')) previous = git(root, ['show', `origin/${base}:${rel}`]);
-  return previous;
+  return gitShowState(root, rel, base);
 }
 
 /**
@@ -72,7 +85,7 @@ function textAtBase(root, rel, base) {
 function registryIsAdditiveOnly(root, config, base) {
   const previous = textAtBase(root, config.registryFile, base);
   if (previous == null) return false;
-  const currentPath = path.join(root, config.registryFile);
+  const currentPath = resolveStatePath(root, config.registryFile);
   const current = fs.existsSync(currentPath) ? fs.readFileSync(currentPath, 'utf8') : null;
   if (current == null) return false;
   const { kind } = classifyRegistryDiff(previous, current);
@@ -95,8 +108,8 @@ function managedViolations(root, config) {
   }
   const skill = config.managed?.skillFile;
   if (config.managed?.requireSkill) {
-    if (!skill || !exists(path.join(root, skill))) out.push(violation('policy/managed-file', [skill || '.greenroom'], `Required Green Room hygiene skill is missing: ${skill || '(not configured)'}`, skill || 'skill'));
-    else if (config.managed?.enforceSkillExact && fs.readFileSync(path.join(root, skill), 'utf8') !== SKILL_TEXT) out.push(violation('policy/managed-file', [skill], `Green Room hygiene skill was modified: ${skill}`, `${skill}:content`));
+    if (!skill || !exists(resolveStatePath(root, skill))) out.push(violation('policy/managed-file', [skill || '.greenroom'], `Required Green Room hygiene skill is missing: ${skill || '(not configured)'}`, skill || 'skill'));
+    else if (config.managed?.enforceSkillExact && fs.readFileSync(resolveStatePath(root, skill), 'utf8') !== SKILL_TEXT) out.push(violation('policy/managed-file', [skill], `Green Room hygiene skill was modified: ${skill}`, `${skill}:content`));
   }
   const workflow = config.managed?.workflowFile;
   if (config.managed?.requireWorkflow) {

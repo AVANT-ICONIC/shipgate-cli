@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import path from 'node:path';
 import { writeJson, readJsonStrict, exists } from './lib/fs.mjs';
+import { resolveStatePath } from './paths.ts';
 import { policyHash, registryHash, generatedHash } from './integrity.mjs';
 import { waiversHash } from './waivers.mjs';
 
@@ -16,7 +17,7 @@ function validateBaseline(data, label) {
 }
 
 export function makeBaseline(root, config, result) {
-  const file = path.join(root, config.baselineFile);
+  const file = resolveStatePath(root, config.baselineFile);
   const baseline = {
     version: 1,
     createdAt: new Date().toISOString(),
@@ -32,6 +33,6 @@ export function makeBaseline(root, config, result) {
   return baseline;
 }
 export function loadBaseline(root, config) {
-  const file = path.join(root, config.baselineFile);
+  const file = resolveStatePath(root, config.baselineFile);
   return exists(file) ? validateBaseline(readJsonStrict(file, config.baselineFile), config.baselineFile) : null;
 }

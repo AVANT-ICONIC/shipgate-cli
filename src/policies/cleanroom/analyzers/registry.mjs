@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import path from 'node:path';
 import { readJsonStrict, exists, isSafeRelativePath, matchesAnyPattern } from '../lib/fs.mjs';
+import { resolveStatePath } from '../paths.ts';
 import { violation } from '../violations.mjs';
 import { finding } from '../evidence.mjs';
 
@@ -42,7 +43,7 @@ function validatePathArray(values, label) {
 }
 
 export function loadRegistry(root, config) {
-  const p = path.join(root, config.registryFile);
+  const p = resolveStatePath(root, config.registryFile);
   if (!exists(p)) return emptyRegistry();
   const registry = readJsonStrict(p, config.registryFile);
   if (!registry || typeof registry !== 'object' || Array.isArray(registry)) throw new Error(`${config.registryFile} must contain an object`);
