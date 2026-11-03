@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import path from 'node:path';
 import { exists, readJsonStrict, writeJson } from './lib/fs.mjs';
+import { resolveStatePath } from './paths.ts';
 import { sha } from './lib/fs.mjs';
 
 export function emptyWaivers() { return { version: 1, waivers: [] }; }
 
 export function loadWaivers(root, config) {
-  const file = path.join(root, config.waiversFile);
+  const file = resolveStatePath(root, config.waiversFile);
   if (!exists(file)) return emptyWaivers();
   const data = readJsonStrict(file, config.waiversFile);
   if (!data || typeof data !== 'object' || data.version !== 1 || !Array.isArray(data.waivers)) throw new Error(`${config.waiversFile} must contain { "version": 1, "waivers": [] }`);
@@ -66,7 +67,7 @@ export function addWaiver(root, config, violation, { reason, owner = '', expires
   const idx = data.waivers.findIndex((x) => x.id === violation.id);
   if (idx >= 0) data.waivers[idx] = next; else data.waivers.push(next);
   data.waivers.sort((a,b) => a.id.localeCompare(b.id));
-  writeJson(path.join(root, config.waiversFile), data);
+  writeJson(resolveStatePath(root, config.waiversFile), data);
   return next;
 }
 
@@ -74,6 +75,6 @@ export function removeWaiver(root, config, id) {
   const data = loadWaivers(root, config);
   const before = data.waivers.length;
   data.waivers = data.waivers.filter((x) => x.id !== id);
-  writeJson(path.join(root, config.waiversFile), data);
+  writeJson(resolveStatePath(root, config.waiversFile), data);
   return before !== data.waivers.length;
 }

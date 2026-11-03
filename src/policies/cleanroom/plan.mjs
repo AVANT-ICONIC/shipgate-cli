@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { writeJson, writeText, readJsonStrict, readJson } from './lib/fs.mjs';
+import { resolveStatePath } from './paths.ts';
 import { groupByRule } from './report.mjs';
 import { scan } from './scanner.mjs';
 import { evaluateCheck } from './check.mjs';
@@ -141,7 +142,7 @@ export function nextCleanupBatch(plan) {
 }
 
 export function writePlan(root, plan) {
-  writeJson(path.join(root, '.greenroom/cleanup-plan.json'), plan);
+  writeJson(resolveStatePath(root, '.greenroom/cleanup-plan.json'), plan);
   const md = ['# Green Room Cleanup Plan', '', `Base commit: **${plan.baseCommit || 'unavailable'}**`, `Current entropy: **${plan.entropy}**`, `Violations: **${plan.totalViolations}**`, `Evidence findings: **${plan.totalFindings || 0}**`, '', '> Generated evidence only. Clean one bounded batch at a time. No analyzer has mutation authority.', ''];
   plan.phases.forEach((p, i) => {
     md.push(`## Phase ${String(i+1).padStart(2,'0')} — ${p.title}`, '', `Rule: \`${p.rule}\` · ${p.count} item(s)`, '');
@@ -155,11 +156,11 @@ export function writePlan(root, plan) {
       md.push('');
     }
   });
-  writeText(path.join(root, '.greenroom/cleanup-plan.md'), md.join('\n'));
+  writeText(resolveStatePath(root, '.greenroom/cleanup-plan.md'), md.join('\n'));
 }
 
 export function findCampaign(root, id) {
-  const plan=readJsonStrict(path.join(root,'.greenroom/cleanup-plan.json'),'.greenroom/cleanup-plan.json');
+  const plan=readJsonStrict(resolveStatePath(root,'.greenroom/cleanup-plan.json'),'.greenroom/cleanup-plan.json');
   for (const phase of plan.phases || []) for (const batch of phase.batches || []) if (batch.id===id) return { plan, phase, batch };
   return null;
 }
@@ -208,6 +209,6 @@ export function verifyCampaign(root, config, id, { runCommands = true } = {}) {
   const ok=!unresolved.length && !unresolvedFindings.length && !approvalPending && commandsPass && (!gate || gate.exitCode===0);
   const ratchetDelta={removedViolationIds:(found.batch.ratchet?.targetViolationIds||[]).filter((x)=>!currentIds.has(x)),removedFindingIds:(found.batch.findingIds||[]).filter((x)=>!currentFindingIds.has(x))};
   const result={version:1,campaign:id,verifiedAt:new Date().toISOString(),baseCommit:found.batch.baseCommit||found.plan.baseCommit||null,ok,state:ok?'VERIFIED':'CLEANUP_PLAN_READY',approvalPending,unresolvedViolationIds:unresolved,unresolvedFindingIds:unresolvedFindings,commandResults,ratchetDelta,gate:gate?{exitCode:gate.exitCode,fresh:gate.fresh}:null};
-  const dir=path.join(root,'.greenroom','campaigns'); fs.mkdirSync(dir,{recursive:true}); writeJson(path.join(dir,`${id}.json`),result);
+  const dir=resolveStatePath(root,'.greenroom/campaigns'); fs.mkdirSync(dir,{recursive:true}); writeJson(path.join(dir,`${id}.json`),result);
   return result;
 }

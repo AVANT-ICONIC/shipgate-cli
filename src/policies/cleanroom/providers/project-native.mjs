@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { finding, mergeFindings } from '../evidence.mjs';
 import { exists, readJsonStrict } from '../lib/fs.mjs';
+import { resolveStatePath } from '../paths.ts';
 
 export function createProjectNativeProvider(config = {}) {
   return {
@@ -10,11 +11,11 @@ export function createProjectNativeProvider(config = {}) {
     capabilities() { return ['project-native', 'code-graph', 'runtime-evidence']; },
     available(root) {
       const rel = config.directory || '.greenroom/evidence';
-      return { available: true, command: null, sourceDirectory: rel, exists: exists(path.join(root, rel)) };
+      return { available: true, command: null, sourceDirectory: rel, exists: exists(resolveStatePath(root, rel)) };
     },
     scan(root) {
       const rel = config.directory || '.greenroom/evidence';
-      const dir = path.join(root, rel);
+      const dir = resolveStatePath(root, rel);
       if (!exists(dir)) return { provider: 'project-native', available: true, status: 'ok', findings: [], sources: [] };
       const files = fs.readdirSync(dir, { withFileTypes: true }).filter((x) => x.isFile() && x.name.endsWith('.json')).map((x) => x.name).sort();
       const findings=[]; const sources=[]; const errors=[];

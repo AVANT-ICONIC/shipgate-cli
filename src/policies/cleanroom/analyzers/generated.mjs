@@ -2,12 +2,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { exists, readJsonStrict, isSafeRelativePath, walk, matchesAnyPattern } from '../lib/fs.mjs';
+import { resolveStatePath } from '../paths.ts';
 import { violation } from '../violations.mjs';
 import { finding } from '../evidence.mjs';
 
 export function emptyGeneratedRegistry() { return { version: 1, artifacts: {} }; }
 export function loadGeneratedRegistry(root, config) {
-  const file = path.join(root, config.generatedFile);
+  const file = resolveStatePath(root, config.generatedFile);
   if (!exists(file)) return emptyGeneratedRegistry();
   const data = readJsonStrict(file, config.generatedFile);
   if (!data || typeof data !== 'object' || data.version !== 1 || !data.artifacts || typeof data.artifacts !== 'object' || Array.isArray(data.artifacts)) throw new Error(`${config.generatedFile} must be a version 1 object with artifacts`);

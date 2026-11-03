@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { DEFAULT_CONFIG } from './defaults.mjs';
 import { readJsonStrict, writeJson, exists, isSafeRelativePath } from './lib/fs.mjs';
+import { resolveConfigPath } from './paths.ts';
 
 const RULE_KEYS = new Set(Object.keys(DEFAULT_CONFIG.rules));
 const DESIGN_KEYS = new Set(Object.keys(DEFAULT_CONFIG.design));
@@ -81,7 +82,7 @@ export function validateConfig(config) {
   return config;
 }
 
-export function configPath(root) { return path.join(root, '.greenroom.json'); }
+export function configPath(root) { return resolveConfigPath(root); }
 export function loadPolicySource(root) {
   const file = configPath(root);
   return exists(file) ? readJsonStrict(file, '.greenroom.json') : {};
