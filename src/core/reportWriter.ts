@@ -10,6 +10,23 @@ function statusIcon(status: string): string {
   return status === "passed" ? "✅" : status === "failed" ? "🔥" : "⏭️";
 }
 
+function policyFindingLines(step: StepResult): string[] {
+  const details = step.details;
+  if (!details || typeof details.policyStatus !== "string") return [];
+  const lines: string[] = [`- Policy status: ${details.policyStatus}`];
+  const findings = Array.isArray(details.findings) ? details.findings : [];
+  if (findings.length) {
+    lines.push("", `Findings (${findings.length}):`);
+    for (const finding of findings.slice(0, 25)) {
+      const f = finding as { rule?: unknown; message?: unknown; paths?: unknown };
+      const paths = Array.isArray(f.paths) ? (f.paths as unknown[]).join(", ") : "";
+      lines.push(`- [${String(f.rule ?? "unknown")}] ${String(f.message ?? "")}${paths ? ` (${paths})` : ""}`);
+    }
+    if (findings.length > 25) lines.push(`- …and ${findings.length - 25} more`);
+  }
+  return lines;
+}
+
 function formatStep(projectRoot: string, step: StepResult): string {
   const lines: string[] = [];
   lines.push(`### ${statusIcon(step.status)} ${step.name}`);
@@ -20,6 +37,7 @@ function formatStep(projectRoot: string, step: StepResult): string {
   lines.push(`- Duration: ${step.durationMs}ms`);
   if (step.command) lines.push(`- Command: \`${step.command}\``);
   if (typeof step.exitCode !== "undefined") lines.push(`- Exit code: ${step.exitCode}`);
+  lines.push(...policyFindingLines(step));
   if (step.error) {
     lines.push("");
     lines.push("Error:");

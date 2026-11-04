@@ -15,6 +15,9 @@ import { runCommandStep, stripRawCommandOutput } from "./commandRunner.js";
 import { createFreshCopy } from "./freshCopy.js";
 import { startManagedProcess, waitForUrl, type ManagedProcess } from "./processManager.js";
 import { runBrowserFlow } from "../browser/playwrightRunner.js";
+import { builtInPolicies } from "../policies/registry.js";
+import { disabledPolicyStep, runPolicy } from "../policies/runner.js";
+import type { PoliciesConfig } from "../config/schema.js";
 import { runCliFlow } from "../checks/cliCheck.js";
 import { runApiFlow } from "../checks/apiCheck.js";
 import { runFileFlow } from "../checks/fileCheck.js";
@@ -248,6 +251,40 @@ export async function runVerification(
     );
   }
 
+  // Enabled policy packs run after the path policy and required-files
+  // preflight, but before beforeVerify hooks and normalized build/test
+  // commands (spec Step 4). Policies return values; a blocking finding is a
+  // failed required step and the run still reaches writeReport and
+  // writeRepairPrompt (spec section 2.2).
+  async function runPolicyPhase(): Promise<boolean> {
+    for (const policyId of builtInPolicies.ids()) {
+      const explicitlySelected = options.step === `policy:${policyId}` || options.step === policyId;
+      if (options.step && !explicitlySelected) continue;
+      const policyConfig = config.policies[policyId as keyof PoliciesConfig];
+      if (!policyConfig?.enabled) {
+        // A disabled pack stays silent in ordinary runs; an explicitly
+        // selected one reports as skipped instead of "no step matched".
+        if (explicitlySelected) {
+          matchedSelectedStep = true;
+          steps.push(disabledPolicyStep(policyId));
+        }
+        continue;
+      }
+      matchedSelectedStep = true;
+      const stepResult = await runPolicy(builtInPolicies.get(policyId), {
+        projectRoot,
+        verificationRoot,
+        config: policyConfig,
+        artifacts: store
+      });
+      steps.push(stepResult);
+      if (stepResult.status === "failed" && config.failurePolicy.stopOnFirstCommandFailure) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   try {
     if (options.fresh) {
       freshCopy = await createFreshCopy(roots.sourceWorkspaceRoot, config.fresh.exclude);
@@ -285,6 +322,10 @@ export async function runVerification(
       const requiredFiles = await runRequiredFiles(config, verificationRoot);
       steps.push(requiredFiles);
       stopped = requiredFiles.status === "failed" && config.failurePolicy.stopOnFirstCommandFailure;
+    }
+
+    if (!stopped) {
+      stopped = await runPolicyPhase();
     }
 
     if (!stopped) {
