@@ -38,6 +38,28 @@ export async function writeRepairPrompt(result: VerificationResult): Promise<str
     lines.push(`- Kind: ${step.kind}`);
     lines.push(`- Command: ${step.command ? `\`${step.command}\`` : "n/a"}`);
     lines.push(`- Exit code: ${typeof step.exitCode === "undefined" ? "n/a" : step.exitCode}`);
+    if (step.kind === "policy" && step.details && typeof step.details.policyStatus === "string") {
+      lines.push(`- Policy status: ${step.details.policyStatus}`);
+      const findings = Array.isArray(step.details.findings) ? step.details.findings : [];
+      if (findings.length) {
+        lines.push("");
+        lines.push(`Policy findings (${findings.length}):`);
+        for (const finding of findings.slice(0, 25)) {
+          const f = finding as { rule?: unknown; message?: unknown; paths?: unknown };
+          const paths = Array.isArray(f.paths) ? (f.paths as unknown[]).join(", ") : "";
+          lines.push(`- [${String(f.rule ?? "unknown")}] ${String(f.message ?? "")}${paths ? ` (${paths})` : ""}`);
+        }
+        if (findings.length > 25) lines.push(`- …and ${findings.length - 25} more`);
+      }
+      if (step.stdoutExcerpt) {
+        lines.push("");
+        lines.push("Policy output:");
+        lines.push("");
+        lines.push("```");
+        lines.push(step.stdoutExcerpt);
+        lines.push("```");
+      }
+    }
     if (step.error) {
       lines.push("");
       lines.push("Error:");

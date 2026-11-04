@@ -1,4 +1,5 @@
 import type { PolicyModule } from "./types.js";
+import { cleanroomPolicy } from "./cleanroom/index.js";
 
 export class PolicyRegistry {
   readonly #modules = new Map<string, PolicyModule>();
@@ -29,4 +30,4 @@ export class PolicyRegistry {
   }
 }
 
-export const builtInPolicies = new PolicyRegistry();
+export const builtInPolicies = new PolicyRegistry([cleanroomPolicy]);

@@ -4,7 +4,7 @@ import path from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { shipGateJsonSchema } from "../config/jsonSchema.js";
 import { loadConfig } from "../config/loadConfig.js";
-import type { StepResult, VerificationResult } from "../config/schema.js";
+import type { VerificationResult } from "../config/schema.js";
 import { runVerification } from "../core/runner.js";
 
 export type VerifyToolInput = {
@@ -40,7 +40,7 @@ function jsonResult(value: unknown): CallToolResult {
   return textResult(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-function failedSteps(result: VerificationResult): Array<Pick<StepResult, "id" | "name" | "kind" | "status" | "error">> {
+function failedSteps(result: VerificationResult) {
   return result.steps
     .filter((step) => step.status === "failed")
     .map((step) => ({
@@ -48,7 +48,13 @@ function failedSteps(result: VerificationResult): Array<Pick<StepResult, "id" | 
       name: step.name,
       kind: step.kind,
       status: step.status,
-      error: step.error
+      error: step.error,
+      ...(typeof step.details?.policyStatus === "string"
+        ? {
+            policyStatus: step.details.policyStatus,
+            findingsCount: Array.isArray(step.details.findings) ? step.details.findings.length : 0
+          }
+        : {})
     }));
 }
 

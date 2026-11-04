@@ -5,3 +5,4 @@ declare module "./waivers.mjs" { export function loadWaivers(root: string, confi
 declare module "./register.mjs" { export function registerCanonical(root: string, config: unknown, args: unknown): unknown; }
 declare module "./plan.mjs" { export function planCleanup(root: string, result: unknown, options?: unknown): unknown; }
 declare module "./providers/index.mjs" { export function scanProviders(root: string, config: unknown, options?: unknown): unknown; }
+declare module "*/cleanroom/check.mjs" { export function evaluateCheck(root: string, options?: { explicitCompareRef?: string | null }): unknown; }

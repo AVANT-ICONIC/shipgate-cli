@@ -20,6 +20,8 @@ export type ExplainedStep = {
   stdoutExcerpt?: string;
   stderrExcerpt?: string;
   artifacts: ArtifactRef[];
+  policyStatus?: string;
+  policyFindingsCount?: number;
 };
 
 export type VerificationExplanation = {
@@ -65,7 +67,13 @@ function explainStep(step: StepResult): ExplainedStep {
     error: step.error,
     stdoutExcerpt: step.stdoutExcerpt,
     stderrExcerpt: step.stderrExcerpt,
-    artifacts: step.artifacts ?? []
+    artifacts: step.artifacts ?? [],
+    ...(typeof step.details?.policyStatus === "string"
+      ? {
+          policyStatus: step.details.policyStatus,
+          policyFindingsCount: Array.isArray(step.details.findings) ? step.details.findings.length : 0
+        }
+      : {})
   };
 }
 

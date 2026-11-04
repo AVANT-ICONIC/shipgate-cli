@@ -21,10 +21,15 @@ export type PolicyResult = {
   details?: Record<string, unknown>;
 };
 
+export type PolicyArtifactWriter = {
+  writeText(kind: ArtifactRef["kind"], label: string, relPath: string, content: string): Promise<ArtifactRef>;
+};
+
 export type PolicyContext<TConfig = unknown> = {
   projectRoot: string;
   verificationRoot: string;
   config: TConfig;
+  artifacts?: PolicyArtifactWriter;
 };
 
 export type PolicyModule<TConfig = unknown> = {

@@ -62,6 +62,10 @@ function failedStepSections(projectRoot: string, steps: StepResult[]): string {
     const error = step.error ? `<h4>Error</h4><pre>${escapeHtml(step.error)}</pre>` : "";
     const stderr = step.stderrExcerpt ? `<h4>Stderr Excerpt</h4><pre>${escapeHtml(step.stderrExcerpt)}</pre>` : "";
     const stdout = step.stdoutExcerpt ? `<h4>Stdout Excerpt</h4><pre>${escapeHtml(step.stdoutExcerpt)}</pre>` : "";
+    const details = step.details;
+    const policyFindings = details && typeof details.policyStatus === "string" && Array.isArray(details.findings) && details.findings.length
+      ? `<h4>Policy findings (${details.findings.length})</h4><ul>${(details.findings.slice(0, 25) as Array<{ rule?: unknown; message?: unknown }>).map((f) => `<li>[${escapeHtml(String(f.rule ?? "unknown"))}] ${escapeHtml(String(f.message ?? ""))}</li>`).join("")}</ul>`
+      : "";
     const artifacts = step.artifacts?.length
       ? `<h4>Artifacts</h4><ul>${step.artifacts.map((artifact) => `<li>${escapeHtml(artifact.label)}: <code>${escapeHtml(rel(projectRoot, artifact.path))}</code></li>`).join("")}</ul>`
       : "";
@@ -75,6 +79,7 @@ function failedStepSections(projectRoot: string, steps: StepResult[]): string {
       error,
       stderr,
       stdout,
+      policyFindings,
       artifacts,
       "</article>"
     ].join("\n");
