@@ -1,106 +1,30 @@
-import { spawnSync } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm, mkdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it, afterEach } from "vitest";
 import { runCleanroomCli } from "../../../src/policies/cleanroom/cli.js";
+import {
+  LEGACY_CLI,
+  OBSERVED_SITES,
+  addSecondViolation,
+  canonical,
+  cleanupRoots,
+  initOpenSpec,
+  legacyExecutableSites,
+  makeRoot,
+  runLegacy,
+  snapshot,
+  type FixtureKind,
+  type Run,
+} from "./step5ParityHarness.js";
+import { readFile } from "node:fs/promises";
 
 // Spec issue #1 step 5 acceptance: table-driven parity between the legacy
 // greenroom cli.mjs and the ported dispatcher -- exit code, stdout (JSON
-// canonicalized), stderr class, and FILESYSTEM SIDE EFFECTS, for every one of
-// the 40 executable legacy process.exit sites. Each site is mapped to the
-// case steps that exercise it, and each step asserts a signature on the
-// legacy run so the mapping is grounded in observed behavior, not asserted.
-
-const LEGACY_CLI = path.resolve("node_modules/@avant-iconic/cleanroom/src/cli.mjs");
-const roots: string[] = [];
-const FIXED_GIT_DATE = "2026-01-01T00:00:00Z";
-
-const ISO_TS = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z/g;
-const DATE_ONLY = /\d{4}-\d{2}-\d{2}/g;
-
-/** Canonicalize brand, absolute fixture root and wall-clock stamps. */
-function canonical(text: string, root: string): string {
-  return text
-    .replaceAll("shipgate policy cleanroom", "greenroom")
-    .replaceAll("ShipGate Cleanroom policy", "Green Room")
-    .replaceAll(root, "<ROOT>")
-    .replace(ISO_TS, "<TS>")
-    .replace(DATE_ONLY, "<DATE>");
-}
-
-function git(root: string, ...args: string[]) {
-  return spawnSync("git", ["-C", root, ...args], {
-    encoding: "utf8",
-    env: { ...process.env, GIT_AUTHOR_DATE: FIXED_GIT_DATE, GIT_COMMITTER_DATE: FIXED_GIT_DATE },
-  });
-}
-
-async function baseRepo(root: string): Promise<void> {
-  git(root, "init", "-q", "-b", "main");
-  git(root, "config", "user.email", "test@example.com");
-  git(root, "config", "user.name", "test");
-  await mkdir(path.join(root, "src"), { recursive: true });
-  await writeFile(path.join(root, "src", "index.ts"), "export const clean = true;\n");
-  git(root, "add", "-A");
-  git(root, "commit", "-qm", "init");
-}
-
-async function addViolationNamed(root: string, a: string, b: string, message: string): Promise<void> {
-  const dup = Array.from({ length: 30 }, (_, i) => `export const l${i} = "dup-${i}";`).join("\n") + "\n";
-  await writeFile(path.join(root, "src", a), dup);
-  await writeFile(path.join(root, "src", b), dup);
-  git(root, "add", "-A");
-  git(root, "commit", "-qm", message);
-}
-
-async function addViolation(root: string): Promise<void> {
-  await addViolationNamed(root, "dup-a.ts", "dup-b.ts", "duplicate violation");
-}
-
-async function addSecondViolation(root: string): Promise<void> {
-  await addViolationNamed(root, "dup-c.ts", "dup-d.ts", "second duplicate violation");
-}
-
-async function initOpenSpec(root: string): Promise<void> {
-  await mkdir(path.join(root, "openspec"), { recursive: true });
-  git(root, "add", "-A");
-  git(root, "commit", "-qm", "openspec init");
-}
-
-type FixtureKind = "clean" | "violation";
-
-async function makeRoot(kind: FixtureKind): Promise<string> {
-  const root = await mkdtemp(path.join(tmpdir(), "shipgate-cli-parity-"));
-  roots.push(root);
-  await baseRepo(root);
-  if (kind === "violation") await addViolation(root);
-  return root;
-}
-
-/** Byte-exact tree snapshot (minus .git), wall-clock stamps normalized. */
-async function snapshot(root: string, dir = root, base = root, out: Record<string, string> = {}): Promise<Record<string, string>> {
-  for (const entry of await readdir(dir, { withFileTypes: true })) {
-    if (entry.name === ".git") continue;
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) await snapshot(root, full, base, out);
-    else {
-      const rel = path.relative(base, full);
-      out[rel] = canonical(await readFile(full, "utf8"), root);
-    }
-  }
-  return out;
-}
-
-type Run = { exitCode: number | null; stdout: string; stderr: string };
-function runLegacy(args: string[], root: string): Run {
-  const r = spawnSync(process.execPath, [LEGACY_CLI, ...args, "--root", root], { encoding: "utf8" });
-  return { exitCode: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
-}
-function runPorted(args: string[], root: string): Run {
-  const r = runCleanroomCli([...args, "--root", root], { cwd: root });
-  return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr };
-}
+// canonicalized), stderr class, and byte-exact FILESYSTEM SIDE EFFECTS, for
+// every one of the 40 executable legacy process.exit sites. Coverage is
+// OBSERVED: the legacy cli runs under an exit-site instrument that records
+// the exact cli.mjs line whose process.exit fired (see step5ParityHarness.ts),
+// and the final test asserts the observed set equals the parsed site list.
+// Each step also declares the sites it intends to hit, and the observation
+// must be one of them -- a declared-but-not-executed mapping fails.
 
 type Step = {
   args: string[] | ((ctx: string) => string[]);
@@ -113,11 +37,17 @@ type Step = {
   mutate?: (root: string) => Promise<void>;
 };
 
+function runPorted(args: string[], root: string): Run {
+  const r = runCleanroomCli([...args, "--root", root], { cwd: root });
+  return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, observedSite: null };
+}
+
 /**
  * Run every step against twin fixtures: legacy cli in root A, ported
  * dispatcher in root B. After EVERY step compare exit code, canonical
- * stdout/stderr, and the full filesystem tree (side-effect parity).
- * Signatures are asserted on the legacy run to ground the site mapping.
+ * stdout/stderr, and the full byte-exact filesystem tree. Signatures are
+ * asserted on the legacy run, and the observed legacy exit site must be one
+ * of the step's declared sites.
  */
 async function runPair(name: string, fixture: FixtureKind, steps: Step[]): Promise<void> {
   const rootA = await makeRoot(fixture);
@@ -132,6 +62,7 @@ async function runPair(name: string, fixture: FixtureKind, steps: Step[]): Promi
     const args = typeof step.args === "function" ? step.args(captured.value ?? "") : step.args;
     const legacy = runLegacy(args, rootA);
     const ported = runPorted(args, rootB);
+    expect(step.sites, `${label} observed legacy exit site ${legacy.observedSite}`).toContain(legacy.observedSite);
     if (step.exit !== undefined) expect(legacy.exitCode, `${label} legacy exit`).toBe(step.exit);
     expect(ported.exitCode, `${label} exit code`).toBe(legacy.exitCode);
     if (step.stdoutSig) expect(canonical(legacy.stdout, rootA), `${label} legacy stdout signature`).toContain(step.stdoutSig);
@@ -149,7 +80,7 @@ async function runPair(name: string, fixture: FixtureKind, steps: Step[]): Promi
     }
     expect(canonical(ported.stdout, rootB), `${label} stdout`).toBe(canonical(legacy.stdout, rootA));
     if (step.capture) captured.value = step.capture(legacy.stdout);
-    expect(await snapshot(rootB), `${label} filesystem side effects`).toEqual(await snapshot(rootA));
+    expect(await snapshot(rootB), `${label} filesystem side effects (byte-exact)`).toEqual(await snapshot(rootA));
   }
 }
 
@@ -167,9 +98,7 @@ function firstBatchId(nextJson: string): string {
   return id;
 }
 
-afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
-});
+afterEach(cleanupRoots);
 
 describe("cleanroom cli dispatcher (spec Step 5)", () => {
   it("never calls process.exit: the tripwire harness patches it to throw", async () => {
@@ -188,21 +117,12 @@ describe("cleanroom cli dispatcher (spec Step 5)", () => {
     expect(calls).toEqual([]);
   }, 60_000);
 
-  it("enumerates the 41 legacy process.exit sites it replaces", async () => {
+  it("pins the 41 legacy process.exit occurrences (40 executable + 1 doc comment)", async () => {
     const source = await readFile(LEGACY_CLI, "utf8");
-    const lines = source.split("\n");
-    const sites = lines.filter((line) => line.includes("process.exit("));
-    // 40 executable sites plus the writeStdout doc comment, pinned so a
-    // legacy cli.mjs change fails this test loudly.
+    const sites = source.split("\n").filter((line) => line.includes("process.exit("));
+    // Pinned so a legacy cli.mjs change fails this test loudly.
     expect(sites.length).toBe(41);
     expect(sites.filter((line) => !line.trim().startsWith("*")).length).toBe(40);
-    // Every executable site (by 1-based line number) is covered by at least
-    // one parity step below; COVERED_SITES is checked against this list.
-    const executable = lines
-      .map((line, i) => ({ line, n: i + 1 }))
-      .filter(({ line }) => line.includes("process.exit(") && !line.trim().startsWith("*"))
-      .map(({ n }) => n);
-    expect([...COVERED_SITES].sort((a, b) => a - b)).toEqual(executable);
   });
 
   it("parity: help, version, unknown command and the catch-all", async () => {
@@ -292,7 +212,7 @@ describe("cleanroom cli dispatcher (spec Step 5)", () => {
       { args: ["next", "--json"], sites: [286], exit: 0, capture: firstBatchId },
       { args: ["cleanup", "approve"], sites: [245], exit: 2, stderrSig: "Usage: greenroom cleanup approve" },
       {
-        args: (ctx) => ["cleanup", "approve", ctx, "--owner", "marc", "--reason", "ok to clean"],
+        args: (ctx) => ["cleanup", "approve", ctx, "--owner", "marc", "--reason", "ok to clean", "--canonical", "none"],
         sites: [249], exit: 0, stdoutSig: "Cleanup campaign approved:",
       },
       { args: ["cleanup", "verify"], sites: [254], exit: 2, stderrSig: "Usage: greenroom cleanup verify" },
@@ -323,13 +243,13 @@ describe("cleanroom cli dispatcher (spec Step 5)", () => {
       { args: ["next"], sites: [286], exit: 0, stdoutSig: "No cleanup batch" },
     ]);
   }, 120_000);
-});
 
-// Every legacy executable exit site (by 1-based line number in the pinned
-// node_modules/@avant-iconic/cleanroom/src/cli.mjs) mapped to the steps
-// above; the enumeration test asserts this set equals the parsed site list.
-const COVERED_SITES = new Set([
-  116, 117, 130, 138, 143, 159, 166, 173, 177, 182, 187, 189, 194, 201, 215,
-  219, 221, 223, 228, 230, 232, 237, 240, 245, 249, 254, 257, 262, 272, 277,
-  286, 291, 296, 298, 302, 307, 309, 312, 315, 318,
-]);
+  // Runs last: the union of exit sites OBSERVED across every step above must
+  // equal the executable sites parsed from the pinned legacy cli. This is an
+  // executed-path proof, not a transcription.
+  it("covers every executable legacy exit site by observation", async () => {
+    const executable = await legacyExecutableSites();
+    expect(executable.length).toBe(40);
+    expect([...OBSERVED_SITES].sort((a, b) => a - b)).toEqual(executable);
+  });
+});
