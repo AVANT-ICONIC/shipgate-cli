@@ -12,6 +12,7 @@ import { registerSchemaCommand } from "./commands/schema.js";
 import { registerMcpCommand } from "./commands/mcp.js";
 import { registerViewReportCommand } from "./commands/viewReport.js";
 import { registerUpdateCommand } from "./commands/update.js";
+import { registerPolicyCommand } from "./commands/policy.js";
 
 /**
  * ONE SOURCE OF TRUTH FOR THE VERSION.
@@ -49,6 +50,7 @@ registerDiscoverCommand(program);
 registerMcpCommand(program);
 registerViewReportCommand(program);
 registerUpdateCommand(program);
+registerPolicyCommand(program);
 
 program.parseAsync(process.argv).catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
