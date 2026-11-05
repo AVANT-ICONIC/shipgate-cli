@@ -1,5 +1,5 @@
 import { writeFile, mkdir, symlink } from "node:fs/promises";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { migrateCleanroom } from "../../../src/policies/cleanroom/migrate.js";
@@ -167,6 +167,53 @@ describe("cleanroom migration (spec Step 6)", () => {
     expect(existsSync(path.join(root, MIGRATED_CONFIG))).toBe(false);
     expect(existsSync(path.join(root, MARKER))).toBe(false);
   }, 60_000);
+
+  it("rolls back completely when the staged copy fails re-inventory", async () => {
+    const root = await legacyRepo();
+    await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify({ profile: "node-cli" }) + "\n");
+    const beforeConfig = readFileSync(path.join(root, "shipgate.config.json"));
+    const before = treeBytes(root, ".greenroom");
+    const result = migrateCleanroom({
+      root,
+      _hooks: { afterStaging: (stagingAbs) => { appendFileSync(path.join(stagingAbs, "cleanroom", "skills", "repo-hygiene", "SKILL.md"), "tampered"); } },
+    });
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("rolled back");
+    expect(result.stderr).toContain("byte hashes or record counts");
+    // Legacy untouched; no destination, staging, lock, or marker left behind;
+    // pre-existing config restored byte-exact.
+    expect(treeBytes(root, ".greenroom")).toEqual(before);
+    expect(existsSync(path.join(root, MIGRATED_CONFIG))).toBe(false);
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false);
+    expect(existsSync(path.join(root, STAGING))).toBe(false);
+    expect(existsSync(path.join(root, LOCK))).toBe(false);
+    expect(readFileSync(path.join(root, "shipgate.config.json"))).toEqual(beforeConfig);
+  }, 120_000);
+
+  it("rolls back completely on a parity mismatch after placement", async () => {
+    const root = await legacyRepo();
+    await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify({ profile: "node-cli", keep: true }) + "\n");
+    const beforeConfig = readFileSync(path.join(root, "shipgate.config.json"));
+    const before = treeBytes(root, ".greenroom");
+    const result = migrateCleanroom({
+      root,
+      // Corrupt the PLACED migrated state after placement but before the
+      // parity check: the migrated dispatcher then disagrees with the legacy
+      // check and the migration must abort atomically.
+      _hooks: { afterPlacement: (r) => { appendFileSync(path.join(r, ".shipgate", "policies", "cleanroom", "waivers.json"), "corrupted"); } },
+    });
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("rolled back");
+    expect(result.stderr).toContain("Parity mismatch");
+    // Atomicity: no destination, staging, lock or marker survives; the legacy
+    // source and the pre-existing user config are byte-identical.
+    expect(treeBytes(root, ".greenroom")).toEqual(before);
+    expect(existsSync(path.join(root, MIGRATED_CONFIG))).toBe(false);
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false);
+    expect(existsSync(path.join(root, STAGING))).toBe(false);
+    expect(existsSync(path.join(root, LOCK))).toBe(false);
+    expect(readFileSync(path.join(root, "shipgate.config.json"))).toEqual(beforeConfig);
+  }, 120_000);
 
   it("after migration the policy dispatcher reads migrated state and check passes", async () => {
     const root = await legacyRepo(false);

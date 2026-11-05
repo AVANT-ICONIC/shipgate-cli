@@ -192,7 +192,14 @@ function legacyCliPath(): string {
 
 
 
-export function migrateCleanroom(options: { root: string; dryRun?: boolean; json?: boolean }): MigrateResult {
+export type MigrateTestHooks = {
+  /** Test seam: runs after staging is complete, before the staged re-inventory. */
+  afterStaging?: (stagingAbs: string) => void;
+  /** Test seam: runs after staged state is placed, before the parity check. */
+  afterPlacement?: (root: string) => void;
+};
+
+export function migrateCleanroom(options: { root: string; dryRun?: boolean; json?: boolean; _hooks?: MigrateTestHooks }): MigrateResult {
   const root = path.resolve(options.root);
   const ctx: Ctx = { root, out: [], err: [] };
   const line = (text: string) => ctx.out.push(`${text}\n`);
@@ -293,6 +300,8 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         fs.writeFileSync(path.join(stagingAbs, "shipgate.config.json"), JSON.stringify({ policies: { cleanroom: POLICY_CONFIG_KEY } }, null, 2) + "\n");
       }
 
+      options._hooks?.afterStaging?.(stagingAbs);
+
       // 6. Re-inventory staging and require every byte hash and count to match.
       const stagedInventory = inventoryState(stagingAbs, "cleanroom.json", "cleanroom");
       const rebasedSource: Inventory = {
@@ -329,6 +338,8 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       };
       fs.mkdirSync(path.dirname(path.join(root, MIGRATION_MARKER)), { recursive: true });
       fs.writeFileSync(path.join(root, MIGRATION_MARKER), JSON.stringify(markerBase, null, 2) + "\n");
+
+      options._hooks?.afterPlacement?.(root);
 
       // 8. Parity: legacy check --json vs migrated dispatcher check --json.
       const legacy = spawnSync(process.execPath, [legacyCliPath(), "check", "--json", "--root", root], { encoding: "utf8" });
