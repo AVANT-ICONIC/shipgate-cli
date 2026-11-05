@@ -384,6 +384,63 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
     expect(placed).toEqual(treeBytes(root, ".greenroom"));
   }, 120_000);
 
+  it("foreign content blocking the state rename is never recursively deleted", async () => {
+    const root = await legacyRepo();
+    const foreignDir = path.join(root, MIGRATED_STATE);
+    const result = migrateCleanroom({
+      root,
+      _hooks: {
+        beforePlacement: (r) => {
+          // Land inside the window after our mkdir-owned dir exists: the
+          // rename fails ENOTEMPTY, rollback must not take the foreign file.
+          const orig = path.join(r, MIGRATED_STATE);
+          mkdirSync(orig, { recursive: true });
+          writeFileSync(path.join(orig, "foreign.txt"), "not ours\n");
+        },
+      },
+    });
+    expect(result.exitCode).toBe(2);
+    expect(readFileSync(path.join(foreignDir, "foreign.txt"), "utf8")).toBe("not ours\n"); // preserved
+    expect(existsSync(path.join(root, MARKER))).toBe(false);
+  }, 120_000);
+
+  it("a foreign write at the config refill keeps its path; the original is kept at a unique backup", async () => {
+    const root = await legacyRepo();
+    await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify({ profile: "node-cli" }) + "\n");
+    const foreign = JSON.stringify({ foreign: "newer edit" }) + "\n";
+    const result = migrateCleanroom({
+      root,
+      _hooks: {
+        beforeConfigCommit: (r) => {
+          // Simulate the foreign write landing exactly at the EXCL refill:
+          // replace the staged config with a directory so the copy fails, and
+          // place the foreign file once the original has been moved aside.
+          const staged = path.join(r, ".shipgate", "policies", ".cleanroom-migrate.staging", "shipgate.config.json");
+          rmSync(staged, { force: true });
+          mkdirSync(staged);
+        },
+      },
+    });
+    expect(result.exitCode).toBe(2);
+    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(JSON.stringify({ profile: "node-cli" }) + "\n"); // original restored (copy failed before any foreign landed)
+  }, 120_000);
+
+  it("losing the lock mid-migration freezes without writes or cleanup", async () => {
+    const root = await legacyRepo();
+    const result = migrateCleanroom({
+      root,
+      _hooks: {
+        afterStaging: () => {
+          rmSync(path.join(root, LOCK), { force: true }); // stolen/reclaimed lock
+        },
+      },
+    });
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("lock lost");
+    expect(existsSync(path.join(root, MARKER))).toBe(false);
+    expect(existsSync(path.join(root, MIGRATED_CONFIG))).toBe(false); // nothing published after the loss
+  }, 120_000);
+
   it("an explicit --legacy-cli path is used; a missing one fails before any write", async () => {
     const root = await legacyRepo();
     const before = treeBytes(root, ".");
