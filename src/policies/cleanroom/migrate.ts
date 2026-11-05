@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import packageJson from "../../../package.json";
+import { loadConfig } from "../cleanroom/config.mjs";
 import {
   LEGACY_CONFIG_FILE,
   LEGACY_STATE_DIR,
@@ -44,6 +45,27 @@ export type InventoryCounts = {
 };
 export type Inventory = { files: InventoryEntry[]; counts: InventoryCounts };
 
+/** Managed files from the legacy config: skill file moves with the state
+ * copy; the workflow file must be regenerated against ShipGate commands
+ * (Step 8 scope), recorded here so the marker carries the obligation. */
+export type ManagedFileEntry = { path: string; action: "move" | "regenerate"; bytes: number; sha256: string };
+
+export function inventoryManagedFiles(root: string): ManagedFileEntry[] {
+  const config = loadConfig(root) as { managed?: { skillFile?: string; workflowFile?: string } };
+  const entries: ManagedFileEntry[] = [];
+  for (const [rel, action] of [
+    [config.managed?.skillFile, "move"],
+    [config.managed?.workflowFile, "regenerate"],
+  ] as const) {
+    if (!rel) continue;
+    const abs = path.join(root, rel);
+    if (!fs.existsSync(abs)) continue;
+    const buf = fs.readFileSync(abs);
+    entries.push({ path: rel, action, bytes: buf.length, sha256: sha256(buf) });
+  }
+  return entries;
+}
+
 export type MigrateResult = { exitCode: 0 | 2; stdout: string; stderr: string; error?: string };
 
 type Ctx = { root: string; out: string[]; err: string[] };
@@ -55,28 +77,41 @@ function fail(ctx: Ctx, message: string): MigrateResult {
   return { exitCode: 2, stdout: ctx.out.join(""), stderr: ctx.err.join(""), error: message };
 }
 
-/** Refuse any symlink under root/rel whose target escapes the repo root. */
-function assertNoEscapingSymlinks(root: string, rel: string): void {
+/** Refuse any symlink inside an inventoried tree: the inventory records
+ * regular files only, so copying must not silently preserve or drop links. */
+function assertNoSymlinksInTree(root: string, rel: string): void {
   const start = path.join(root, rel);
   if (!fs.existsSync(start)) return;
+  if (fs.lstatSync(start).isSymbolicLink()) {
+    throw new Error(`Refusing to migrate a symlinked state path: ${rel}. Replace it with a regular file or directory first.`);
+  }
   const walk = (dir: string): void => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isSymbolicLink()) {
-        const target = fs.realpathSync(full);
-        if (!target.startsWith(root + path.sep) && target !== root) {
-          throw new Error(`Symlink escapes the repository: ${path.relative(root, full)} -> ${target}`);
-        }
-      } else if (entry.isDirectory()) walk(full);
+        throw new Error(`Refusing to migrate a symlink inside ${rel}: ${path.relative(root, full)}. Replace it with a regular file or directory first.`);
+      }
+      if (entry.isDirectory()) walk(full);
     }
   };
-  const stat = fs.lstatSync(start);
-  if (stat.isSymbolicLink()) {
-    const target = fs.realpathSync(start);
-    if (!target.startsWith(root + path.sep)) throw new Error(`Symlink escapes the repository: ${rel} -> ${target}`);
-    return;
+  if (fs.statSync(start).isDirectory()) walk(start);
+}
+
+/** Refuse to write through any symlinked ancestor under root: a symlinked
+ * destination ancestor would redirect mkdir/write/rename outside the repo. */
+function assertContainedAncestors(root: string, rel: string): void {
+  const parts = rel.split("/").filter((x) => x.length > 0 && x !== ".");
+  let cur = root;
+  for (const part of parts.slice(0, -1)) {
+    cur = path.join(cur, part);
+    if (!fs.existsSync(cur)) return; // deeper components will be created as real dirs
+    if (fs.lstatSync(cur).isSymbolicLink()) {
+      throw new Error(`Refusing to write through symlinked directory: ${path.relative(root, cur)}. Remove the symlink or migrate manually.`);
+    }
+    if (!fs.statSync(cur).isDirectory()) {
+      throw new Error(`Destination ancestor is not a directory: ${path.relative(root, cur)}.`);
+    }
   }
-  if (stat.isDirectory()) walk(start);
 }
 
 function readJsonFile(file: string, label: string): unknown {
@@ -101,6 +136,19 @@ function walkFiles(root: string, rel: string, into: InventoryEntry[]): void {
   const stat = fs.lstatSync(start);
   if (stat.isFile()) {
     const buf = fs.readFileSync(start);
+    // Every structured state file must actually parse; a corrupt payload must
+    // never be reported as a successful, verified migration.
+    if (rel.endsWith(".json")) readJsonFile(start, rel);
+    if (rel.endsWith(".jsonl")) {
+      const lines = buf.toString("utf8").split("\n").filter((l) => l.trim().length > 0);
+      for (const [i, line] of lines.entries()) {
+        try {
+          JSON.parse(line);
+        } catch {
+          throw new Error(`Malformed JSONL in ${rel} line ${i + 1}`);
+        }
+      }
+    }
     into.push({ path: rel.split(path.sep).join("/"), bytes: buf.length, sha256: sha256(buf) });
     return;
   }
@@ -113,8 +161,8 @@ function walkFiles(root: string, rel: string, into: InventoryEntry[]): void {
 
 /** Inventory every byte of the legacy (or staged) policy state, with record counts. */
 export function inventoryState(root: string, configRel: string, stateRel: string): Inventory {
-  assertNoEscapingSymlinks(root, configRel);
-  assertNoEscapingSymlinks(root, stateRel);
+  assertNoSymlinksInTree(root, configRel);
+  assertNoSymlinksInTree(root, stateRel);
   const files: InventoryEntry[] = [];
   walkFiles(root, configRel, files);
   walkFiles(root, stateRel, files);
@@ -144,12 +192,19 @@ function inventoriesEqual(a: Inventory, b: Inventory): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function copyStateInto(root: string, stagingAbs: string): void {
+/** Copy exactly the inventoried legacy files into a full-root staging mirror:
+ * staging/shipgate.config.json plus staging/<MIGRATED_CONFIG_FILE> and
+ * staging/<MIGRATED_STATE_DIR>/... Only inventoried bytes are staged. */
+function copyStateInto(root: string, stagingAbs: string, sourceInventory: Inventory): void {
   fs.mkdirSync(stagingAbs, { recursive: true });
-  fs.copyFileSync(path.join(root, LEGACY_CONFIG_FILE), path.join(stagingAbs, "cleanroom.json"));
-  const stateSrc = path.join(root, LEGACY_STATE_DIR);
-  if (fs.existsSync(stateSrc)) {
-    fs.cpSync(stateSrc, path.join(stagingAbs, "cleanroom"), { recursive: true, verbatimSymlinks: true });
+  for (const f of sourceInventory.files) {
+    const src = path.join(root, ...f.path.split("/"));
+    const rel = f.path === LEGACY_CONFIG_FILE
+      ? MIGRATED_CONFIG_FILE
+      : `${MIGRATED_STATE_DIR}/${f.path.slice(LEGACY_STATE_DIR.length + 1)}`;
+    const dst = path.join(stagingAbs, ...rel.split("/"));
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.copyFileSync(src, dst);
   }
 }
 
@@ -185,9 +240,34 @@ function canonicalJson(text: string): string {
   return JSON.stringify(parsed, (key, value: unknown) => (typeof value === "string" ? value.replace(ISO_OUT, "<TS>") : value));
 }
 
-function legacyCliPath(): string {
-  const require = createRequire(import.meta.url);
-  return require.resolve("@avant-iconic/cleanroom/src/cli.mjs");
+type LegacyCli = { command: string; prefixArgs: string[]; via: string };
+
+/** Resolve a supported legacy Cleanroom CLI for the parity proof: an explicit
+ * --legacy-cli path, the bundled @avant-iconic/cleanroom dependency, or a
+ * greenroom executable on PATH. Returns null when none is available. */
+function resolveLegacyCli(explicit?: string): LegacyCli | null {
+  if (explicit) {
+    const abs = path.resolve(explicit);
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return null;
+    return { command: process.execPath, prefixArgs: [abs], via: `--legacy-cli (${abs})` };
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const resolved = require.resolve("@avant-iconic/cleanroom/src/cli.mjs");
+    return { command: process.execPath, prefixArgs: [resolved], via: "bundled @avant-iconic/cleanroom" };
+  } catch {
+    // not installed alongside ShipGate: fall through to PATH
+  }
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    const candidate = path.join(dir, "greenroom");
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return { command: candidate, prefixArgs: [], via: `greenroom on PATH (${candidate})` };
+    } catch {
+      // keep searching
+    }
+  }
+  return null;
 }
 
 
@@ -199,7 +279,7 @@ export type MigrateTestHooks = {
   afterPlacement?: (root: string) => void;
 };
 
-export function migrateCleanroom(options: { root: string; dryRun?: boolean; json?: boolean; _hooks?: MigrateTestHooks }): MigrateResult {
+export function migrateCleanroom(options: { root: string; dryRun?: boolean; json?: boolean; legacyCli?: string; _hooks?: MigrateTestHooks }): MigrateResult {
   const root = path.resolve(options.root);
   const ctx: Ctx = { root, out: [], err: [] };
   const line = (text: string) => ctx.out.push(`${text}\n`);
@@ -214,16 +294,41 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
     const migratedPresent = fs.existsSync(path.join(root, MIGRATED_CONFIG_FILE)) || fs.existsSync(path.join(root, MIGRATED_STATE_DIR));
 
     if (fs.existsSync(markerAbs)) {
-      // Re-run semantics: identical completed migration is a no-op; changed
-      // legacy source after migration is a conflict.
+      // Re-run semantics. Only a finalized marker (status "completed" with a
+      // parity digest) proves a migration; anything else is an interrupted
+      // attempt and must not be reported as success.
+      const marker = readJsonFile(markerAbs, MIGRATION_MARKER) as {
+        sourceInventory?: Inventory;
+        stagedInventory?: Inventory;
+        status?: string;
+        parityDigest?: string | null;
+      };
+      if (marker.status !== "completed" || typeof marker.parityDigest !== "string" || marker.parityDigest.length === 0) {
+        return fail(ctx, `Found an interrupted migration marker (${MIGRATION_MARKER}, status ${marker.status ?? "unknown"}). A previous migration did not finish; its results are unverified. Inspect ${MIGRATED_STATE_DIR}/, then remove the marker (and any partial destination) or restore from the untouched legacy state before re-running.`);
+      }
+      if (!migratedPresent) {
+        return fail(ctx, `Migration marker ${MIGRATION_MARKER} records a completed migration, but the migrated destination is missing. Restoring is a deliberate act: re-copy from the untouched legacy state or remove the marker.`);
+      }
+      if (!marker.stagedInventory) {
+        return fail(ctx, `Migration marker ${MIGRATION_MARKER} is missing its destination inventory; cannot verify the migrated state. Remove the marker and re-migrate deliberately.`);
+      }
+      let destCurrent: Inventory;
+      try {
+        destCurrent = inventoryState(root, MIGRATED_CONFIG_FILE, MIGRATED_STATE_DIR);
+      } catch (error) {
+        return fail(ctx, `Migrated destination no longer matches the recorded migration (${MIGRATION_MARKER}): ${error instanceof Error ? error.message : String(error)}. Reconcile deliberately.`);
+      }
+      destCurrent.files = destCurrent.files.filter((f) => f.path !== MIGRATION_MARKER);
+      if (!inventoriesEqual(marker.stagedInventory, destCurrent)) {
+        return fail(ctx, `Migrated destination no longer matches the recorded migration (${MIGRATION_MARKER}): files were changed, added, or removed after migration. Refusing to guess; reconcile deliberately.`);
+      }
       if (!legacyPresent) {
-        line("Cleanroom policy state already migrated; no legacy source remains. Nothing to do.");
+        line("Cleanroom policy state already migrated and verified; no legacy source remains. Nothing to do.");
         return done(0);
       }
-      const marker = readJsonFile(markerAbs, MIGRATION_MARKER) as { sourceInventory?: Inventory };
       const current = inventoryState(root, LEGACY_CONFIG_FILE, LEGACY_STATE_DIR);
       if (marker.sourceInventory && inventoriesEqual(marker.sourceInventory, current)) {
-        line("Cleanroom policy migration already completed for this exact legacy state. No-op.");
+        line("Cleanroom policy migration already completed and verified for this exact legacy state. No-op.");
         return done(0);
       }
       return fail(ctx, "Legacy Cleanroom state changed after the completed migration. This is a conflict: keep the migrated state or re-migrate deliberately after removing " + MIGRATION_MARKER + ".");
@@ -240,7 +345,22 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
     // Config must parse as a legacy Cleanroom config object.
     readJsonFile(legacyConfigAbs, LEGACY_CONFIG_FILE);
 
+    const planSummary = () => {
+      line(`Cleanroom migration plan for ${root}`);
+      line(`  source: ${LEGACY_CONFIG_FILE} + ${LEGACY_STATE_DIR}/ (${sourceInventory.files.length} files, ${sourceInventory.files.reduce((n, f) => n + f.bytes, 0)} bytes)`);
+      line(`  destination: ${MIGRATED_CONFIG_FILE} + ${MIGRATED_STATE_DIR}/ (byte-for-byte copy; legacy state is kept)`);
+      line(`  config: ${configAction.kind === "json-merge" ? "merge policies.cleanroom into shipgate.config.json" : configAction.kind === "already-present" ? "policies.cleanroom already configured" : "create shipgate.config.json with policies.cleanroom"}`);
+    };
+
     const configAction = planShipGateConfig(root);
+    if (options.dryRun) {
+      planSummary();
+      if (configAction.kind === "ts-patch-required") {
+        line(`ShipGate config is TypeScript/JavaScript (${path.basename(configAction.file)}): a real run would write a proposed patch to ${CONFIG_PATCH_FILE} and stop.`);
+      }
+      line("Dry run: no changes were made.");
+      return done(0);
+    }
     if (configAction.kind === "ts-patch-required") {
       const patchPath = path.join(root, CONFIG_PATCH_FILE);
       fs.mkdirSync(path.dirname(patchPath), { recursive: true });
@@ -253,45 +373,104 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       return done(2);
     }
 
-    const planSummary = () => {
-      line(`Cleanroom migration plan for ${root}`);
-      line(`  source: ${LEGACY_CONFIG_FILE} + ${LEGACY_STATE_DIR}/ (${sourceInventory.files.length} files, ${sourceInventory.files.reduce((n, f) => n + f.bytes, 0)} bytes)`);
-      line(`  destination: ${MIGRATED_CONFIG_FILE} + ${MIGRATED_STATE_DIR}/ (byte-for-byte copy; legacy state is kept)`);
-      line(`  config: ${configAction.kind === "json-merge" ? "merge policies.cleanroom into shipgate.config.json" : configAction.kind === "already-present" ? "policies.cleanroom already configured" : "create shipgate.config.json with policies.cleanroom"}`);
-    };
-
-    if (options.dryRun) {
-      planSummary();
-      line("Dry run: no changes were made.");
-      return done(0);
-    }
-
-    // 2. Refuse an active migration lock; clean only stale staging.
+    // 2. Containment: never write through a symlinked ancestor, for every path
+    // this command creates or overwrites.
     const lockAbs = path.join(root, LOCK_FILE);
     const stagingAbs = path.join(root, STAGING_DIR);
-    if (fs.existsSync(lockAbs)) return fail(ctx, `An active migration lock exists: ${LOCK_FILE}. Refusing to start another migration.`);
-    if (fs.existsSync(stagingAbs)) fs.rmSync(stagingAbs, { recursive: true, force: true }); // interrupted staging recovery
-
     const placedConfig = path.join(root, MIGRATED_CONFIG_FILE);
     const placedState = path.join(root, MIGRATED_STATE_DIR);
     const shipgateConfigAbs = path.join(root, "shipgate.config.json");
+    for (const abs of [lockAbs, stagingAbs, placedConfig, placedState, shipgateConfigAbs, markerAbs, path.join(root, CONFIG_PATCH_FILE)]) {
+      assertContainedAncestors(root, path.relative(root, abs));
+    }
+
+    // The legacy CLI is needed for the parity proof; fail before any write if
+    // it is not installed (e.g. a production install without devDependencies).
+    const legacyCli = resolveLegacyCli(options.legacyCli);
+    if (!legacyCli) {
+      return fail(ctx, options.legacyCli
+        ? `Cannot prove parity: --legacy-cli path does not exist or is not a file (${options.legacyCli}).`
+        : "Cannot prove parity: no legacy Cleanroom CLI found. Pass --legacy-cli <path-to-cli.mjs>, install @avant-iconic/cleanroom alongside ShipGate, or put greenroom on PATH.");
+    }
+
+    // 3. Fast path: report an obviously present lock (read-only, no mutation).
+    if (fs.existsSync(lockAbs)) return fail(ctx, `An active migration lock exists: ${LOCK_FILE}. Refusing to start another migration.`);
+
+    // Ownership-tracked rollback: only resources this process created are
+    // removed, and only when this process holds the lock. A process that loses
+    // the lock race owns nothing and must not touch the winner's files.
+    let lockOwned = false;
+    let stagingOwned = false;
+    let placedConfigOwned = false;
+    let placedStateOwned = false;
+    let shipgateConfigOwned = false;
     const originalShipgateConfig = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
     const rollback = () => {
-      fs.rmSync(stagingAbs, { recursive: true, force: true });
-      fs.rmSync(placedConfig, { force: true });
-      fs.rmSync(placedState, { recursive: true, force: true });
+      if (!lockOwned) return;
+      if (placedStateOwned) fs.rmSync(placedState, { recursive: true, force: true });
+      if (placedConfigOwned) fs.rmSync(placedConfig, { force: true });
+      if (shipgateConfigOwned) {
+        if (originalShipgateConfig) fs.writeFileSync(shipgateConfigAbs, originalShipgateConfig);
+        else fs.rmSync(shipgateConfigAbs, { force: true });
+      }
+      if (stagingOwned) fs.rmSync(stagingAbs, { recursive: true, force: true });
       fs.rmSync(lockAbs, { force: true });
-      if (originalShipgateConfig) fs.writeFileSync(shipgateConfigAbs, originalShipgateConfig);
-      else fs.rmSync(shipgateConfigAbs, { force: true });
     };
 
     try {
-      // 3. Acquire the lock atomically.
+      // 4. Acquire the lock atomically; recover only a lock whose owner died.
       fs.mkdirSync(path.dirname(lockAbs), { recursive: true });
-      fs.writeFileSync(lockAbs, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + "\n", { flag: "wx" });
+      const lockPayload = () => JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + "\n";
+      const tryAcquire = (): boolean => {
+        try {
+          fs.writeFileSync(lockAbs, lockPayload(), { flag: "wx" });
+          return true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          try {
+            const held = JSON.parse(fs.readFileSync(lockAbs, "utf8")) as { pid?: number };
+            if (typeof held.pid === "number" && held.pid > 0) {
+              try {
+                process.kill(held.pid, 0); // alive (or EPERM: alive, not ours)
+                return false;
+              } catch (signalError) {
+                if ((signalError as NodeJS.ErrnoException).code === "ESRCH") {
+                  fs.rmSync(lockAbs, { force: true }); // stale lock: owner exited
+                  return tryAcquire();
+                }
+                return false;
+              }
+            }
+          } catch (readError) {
+            if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
+              // Unreadable/corrupt lock: the holder may still be running.
+              return false;
+            }
+            return tryAcquire(); // vanished between checks: retry once
+          }
+          return false;
+        }
+      };
+      if (!tryAcquire()) {
+        return fail(ctx, `Another migration holds the lock: ${LOCK_FILE}. Refusing to start; no changes were made.`);
+      }
+      lockOwned = true;
 
-      // 4/5. Stage a byte-for-byte copy.
-      copyStateInto(root, stagingAbs);
+      // 5. Revalidate under the owned lock: the destination and marker were
+      // checked before acquisition and could have changed since.
+      if (fs.existsSync(markerAbs)) {
+        rollback();
+        return fail(ctx, `A migration marker appeared at ${MIGRATION_MARKER} while acquiring the lock; another migration finished first. Re-run to verify its result.`);
+      }
+      if (fs.existsSync(placedConfig) || fs.existsSync(placedState)) {
+        rollback();
+        return fail(ctx, `Migrated destination appeared while acquiring the lock (${MIGRATED_CONFIG_FILE} / ${MIGRATED_STATE_DIR}/). Refusing to combine two state roots.`);
+      }
+      if (fs.existsSync(stagingAbs)) fs.rmSync(stagingAbs, { recursive: true, force: true }); // interrupted staging recovery, under lock
+
+      // 6. Stage a full-root mirror containing only inventoried bytes.
+      copyStateInto(root, stagingAbs, sourceInventory);
+      stagingOwned = true;
       if (configAction.kind === "json-merge") {
         const data = readJsonFile(configAction.file, "shipgate.config.json") as Record<string, unknown>;
         const policies = { ...((data.policies as object) ?? {}), cleanroom: POLICY_CONFIG_KEY };
@@ -302,11 +481,11 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
 
       options._hooks?.afterStaging?.(stagingAbs);
 
-      // 6. Re-inventory staging and require every byte hash and count to match.
-      const stagedInventory = inventoryState(stagingAbs, "cleanroom.json", "cleanroom");
+      // 7. Re-inventory staging and require every byte hash and count to match.
+      const stagedInventory = inventoryState(stagingAbs, MIGRATED_CONFIG_FILE, MIGRATED_STATE_DIR);
       const rebasedSource: Inventory = {
         files: sourceInventory.files.map((f) => ({
-          path: f.path === LEGACY_CONFIG_FILE ? "cleanroom.json" : f.path.replace(/^\.greenroom\//, "cleanroom/"),
+          path: f.path === LEGACY_CONFIG_FILE ? MIGRATED_CONFIG_FILE : `${MIGRATED_STATE_DIR}/${f.path.slice(LEGACY_STATE_DIR.length + 1)}`,
           bytes: f.bytes,
           sha256: f.sha256,
         })),
@@ -316,45 +495,82 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         throw new Error("Staged copy failed verification: byte hashes or record counts do not match the legacy source.");
       }
 
-      // 7. Place the migration atomically (per item), then prove parity with a
-      // provisional marker so the migrated state resolves, then finalize.
-      fs.mkdirSync(path.dirname(placedConfig), { recursive: true });
-      fs.renameSync(path.join(stagingAbs, "cleanroom.json"), placedConfig);
-      if (fs.existsSync(path.join(stagingAbs, "cleanroom"))) fs.renameSync(path.join(stagingAbs, "cleanroom"), placedState);
-      const stagedConfig = path.join(stagingAbs, "shipgate.config.json");
-      if (fs.existsSync(stagedConfig)) fs.renameSync(stagedConfig, shipgateConfigAbs);
-      fs.rmSync(stagingAbs, { recursive: true, force: true });
+      // 8. Parity BEFORE placement: legacy check against the real root vs the
+      // migrated dispatcher against the staging root. No provisional marker is
+      // ever written; a marker only exists once migration is complete.
+      const legacy = spawnSync(legacyCli.command, [...legacyCli.prefixArgs, "check", "--json", "--root", root], { encoding: "utf8" });
+      // The ported side reads the STAGED state while scanning the REAL
+      // repository content: parity compares identical findings, and no marker
+      // exists until the migration is committed.
+      const stagedStateRoot = path.join(stagingAbs, ".shipgate", "policies");
+      process.env.SHIPGATE_CLEANROOM_STATE_ROOT = stagedStateRoot;
+      process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR = root;
+      let ported: ReturnType<typeof runCleanroomCli>;
+      try {
+        ported = runCleanroomCli(["check", "--json", "--root", root], { cwd: root });
+      } finally {
+        delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
+        delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
+      }
+      if (legacy.status !== ported.exitCode || canonicalJson(legacy.stdout) !== canonicalJson(ported.stdout)) {
+        throw new Error(`Parity mismatch before placement: legacy exit ${String(legacy.status)} vs migrated exit ${ported.exitCode}.`);
+      }
+      const parityDigest = sha256(Buffer.from(canonicalJson(legacy.stdout)));
 
-      const markerBase = {
+      // Managed files are read from the legacy config while only the legacy
+      // layout exists (dual-root resolution would refuse later).
+      const managedFiles = inventoryManagedFiles(root);
+
+      // 9. Commit check: the legacy source must not have changed since staging;
+      // otherwise the verified copy is stale and nothing may be placed.
+      if (!inventoriesEqual(sourceInventory, inventoryState(root, LEGACY_CONFIG_FILE, LEGACY_STATE_DIR))) {
+        throw new Error("Legacy source changed during the migration; refusing to commit a stale copy. Re-run to migrate the current state.");
+      }
+
+      // 10. Place the migration, rechecking each destination under the lock.
+      fs.mkdirSync(path.dirname(placedConfig), { recursive: true });
+      if (fs.existsSync(placedConfig)) throw new Error(`Destination appeared during migration: ${MIGRATED_CONFIG_FILE}.`);
+      fs.renameSync(path.join(stagingAbs, MIGRATED_CONFIG_FILE), placedConfig);
+      placedConfigOwned = true;
+      const stagedState = path.join(stagingAbs, MIGRATED_STATE_DIR);
+      if (fs.existsSync(stagedState)) {
+        if (fs.existsSync(placedState)) throw new Error(`Destination appeared during migration: ${MIGRATED_STATE_DIR}/.`);
+        fs.renameSync(stagedState, placedState);
+        placedStateOwned = true;
+      }
+      const stagedConfig = path.join(stagingAbs, "shipgate.config.json");
+      if (fs.existsSync(stagedConfig)) {
+        fs.renameSync(stagedConfig, shipgateConfigAbs); // intentional overwrite; original buffered above
+        shipgateConfigOwned = true;
+      }
+
+      options._hooks?.afterPlacement?.(root);
+
+      // 11. Verify the placed destination byte-for-byte before committing.
+      const placedInventory = inventoryState(root, MIGRATED_CONFIG_FILE, MIGRATED_STATE_DIR);
+      if (!inventoriesEqual(stagedInventory, placedInventory)) {
+        throw new Error("Placed destination failed verification: bytes differ from the verified staging copy.");
+      }
+
+      // 12. Commit: write the finalized marker, then release staging and lock.
+      const marker = {
         version: 1,
+        managedFiles,
         sourceCommit: spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim() || null,
         tools: { shipgate: packageJson.version, cleanroomPolicy: "1.1.0" },
         sourceInventory,
         stagedInventory,
-        parityDigest: null as string | null,
-        status: "verifying" as string,
+        parityDigest,
+        status: "completed",
         startedAt: new Date().toISOString(),
-        completedAt: null as string | null,
+        completedAt: new Date().toISOString(),
       };
-      fs.mkdirSync(path.dirname(path.join(root, MIGRATION_MARKER)), { recursive: true });
-      fs.writeFileSync(path.join(root, MIGRATION_MARKER), JSON.stringify(markerBase, null, 2) + "\n");
-
-      options._hooks?.afterPlacement?.(root);
-
-      // 8. Parity: legacy check --json vs migrated dispatcher check --json.
-      const legacy = spawnSync(process.execPath, [legacyCliPath(), "check", "--json", "--root", root], { encoding: "utf8" });
-      const ported = runCleanroomCli(["check", "--json", "--root", root], { cwd: root });
-      if (legacy.status !== ported.exitCode || canonicalJson(legacy.stdout) !== canonicalJson(ported.stdout)) {
-        throw new Error(`Parity mismatch after migration: legacy exit ${String(legacy.status)} vs migrated exit ${ported.exitCode}.`);
-      }
-      const parityDigest = sha256(Buffer.from(canonicalJson(legacy.stdout)));
-
-      // 9. Finalize the marker.
-      fs.writeFileSync(
-        path.join(root, MIGRATION_MARKER),
-        JSON.stringify({ ...markerBase, parityDigest, status: "completed", completedAt: new Date().toISOString() }, null, 2) + "\n",
-      );
+      fs.mkdirSync(path.dirname(markerAbs), { recursive: true });
+      fs.writeFileSync(markerAbs, JSON.stringify(marker, null, 2) + "\n");
+      fs.rmSync(stagingAbs, { recursive: true, force: true });
+      stagingOwned = false;
       fs.rmSync(lockAbs, { force: true });
+      lockOwned = false;
 
       if (options.json) {
         line(JSON.stringify({ migrated: true, files: sourceInventory.files.length, bytes: sourceInventory.files.reduce((n, f) => n + f.bytes, 0), parityDigest }, null, 2));

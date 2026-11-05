@@ -17,8 +17,9 @@ export function registerMigrateCommand(program: Command): void {
     .option("--root <path>", "repository root")
     .option("--dry-run", "validate and print the plan without changing anything", false)
     .option("--json", "print a machine-readable result", false)
-    .action((options: { root?: string; dryRun: boolean; json: boolean }) => {
-      const result = migrateCleanroom({ root: options.root ?? process.cwd(), dryRun: options.dryRun, json: options.json });
+    .option("--legacy-cli <path>", "path to the legacy Cleanroom CLI script (cli.mjs); overrides auto-detection")
+    .action((options: { root?: string; dryRun: boolean; json: boolean; legacyCli?: string }) => {
+      const result = migrateCleanroom({ root: options.root ?? process.cwd(), dryRun: options.dryRun, json: options.json, legacyCli: options.legacyCli });
       if (result.stdout.length > 0) process.stdout.write(result.stdout);
       if (result.stderr.length > 0) process.stderr.write(result.stderr);
       process.exitCode = result.exitCode;

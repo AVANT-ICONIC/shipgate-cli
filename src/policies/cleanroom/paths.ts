@@ -64,7 +64,34 @@ export function resolveStateRel(root: string, logicalPath: string): string {
   return logicalPath;
 }
 
+/**
+ * Internal migration seam (spec Step 6): when SHIPGATE_CLEANROOM_STATE_ROOT
+ * names a directory containing `cleanroom.json` and `cleanroom/`, state reads
+ * resolve there instead of the repo layout. `shipgate migrate cleanroom` uses
+ * it to parity-check the staged state against the real repository BEFORE any
+ * placement, without a provisional marker ever selecting unverified state.
+ * Not part of the public CLI surface.
+ */
+export function stateRootOverride(root: string): string | null {
+  const value = process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
+  const forRoot = process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
+  if (!value || value.trim().length === 0) return null;
+  // The override is scoped to the migration root: ref worktrees and any other
+  // root must resolve their own layout normally.
+  if (!forRoot || path.resolve(forRoot) !== path.resolve(root)) return null;
+  return value;
+}
+
 export function resolveStatePath(root: string, logicalPath: string): string {
+  const override = stateRootOverride(root);
+  if (override) {
+    if (logicalPath === LEGACY_CONFIG_FILE) return path.join(override, "cleanroom.json");
+    if (logicalPath === LEGACY_STATE_DIR) return path.join(override, "cleanroom");
+    if (logicalPath.startsWith(`${LEGACY_STATE_DIR}/`)) {
+      return path.join(override, "cleanroom", logicalPath.slice(LEGACY_STATE_DIR.length + 1));
+    }
+    return path.join(root, logicalPath);
+  }
   return path.join(root, resolveStateRel(root, logicalPath));
 }
 
