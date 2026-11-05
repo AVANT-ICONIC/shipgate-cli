@@ -168,8 +168,11 @@ export function inventoryState(root: string, configRel: string, stateRel: string
   walkFiles(root, stateRel, files);
   const counts: InventoryCounts = {
     baselineViolations: countField(root, path.join(stateRel, "baseline.json"), (d) => (d as { violations: unknown[] }).violations.length),
-    registryEntries: countField(root, path.join(stateRel, "registry.json"), (d) => Object.keys(d as object).length),
-    generatedArtifacts: countField(root, path.join(stateRel, "generated.json"), (d) => Object.keys(d as object).length),
+    registryEntries: countField(root, path.join(stateRel, "registry.json"), (d) => {
+      const r = d as { responsibilities?: object; components?: object };
+      return Object.keys(r.responsibilities ?? {}).length + Object.keys(r.components ?? {}).length;
+    }),
+    generatedArtifacts: countField(root, path.join(stateRel, "generated.json"), (d) => Object.keys((d as { artifacts?: object }).artifacts ?? {}).length),
     waivers: countField(root, path.join(stateRel, "waivers.json"), (d) => ((d as { waivers?: unknown[] }).waivers ?? []).length),
     governanceLines: (() => {
       const file = path.join(root, stateRel, "governance.jsonl");
@@ -241,6 +244,27 @@ function canonicalJson(text: string): string {
 }
 
 type LegacyCli = { command: string; prefixArgs: string[]; via: string };
+type ComparatorInfo = { via: string; resolvedPath: string; version: string; sha256: string | null };
+
+/** Ground the actual comparator: execute --version, hash the script, and
+ * require the supported legacy Cleanroom line. Anything else is not a valid
+ * parity reference and must not be mislabeled as one in the marker. */
+function probeComparator(cli: LegacyCli): ComparatorInfo {
+  const probe = spawnSync(cli.command, [...cli.prefixArgs, "--version"], { encoding: "utf8" });
+  const out = `${probe.stdout ?? ""}${probe.stderr ?? ""}`.trim();
+  const match = out.match(/(\d+\.\d+\.\d+)/);
+  const matched = match?.[1];
+  if (probe.error || probe.status !== 0 || !matched) {
+    throw new Error(`The legacy Cleanroom comparator (${cli.via}) did not report a version; cannot ground the parity reference.`);
+  }
+  const version: string = matched;
+  if (!version.startsWith("1.1.")) {
+    throw new Error(`The legacy Cleanroom comparator (${cli.via}) reports version ${version}; only the 1.1.x line is a supported parity reference.`);
+  }
+  const scriptPath = cli.prefixArgs[0] ?? cli.command;
+  const hash = fs.existsSync(scriptPath) && fs.statSync(scriptPath).isFile() ? sha256(fs.readFileSync(scriptPath)) : null;
+  return { via: cli.via, resolvedPath: scriptPath, version, sha256: hash };
+}
 
 /** Resolve a supported legacy Cleanroom CLI for the parity proof: an explicit
  * --legacy-cli path, the bundled @avant-iconic/cleanroom dependency, or a
@@ -277,6 +301,8 @@ export type MigrateTestHooks = {
   afterStaging?: (stagingAbs: string) => void;
   /** Test seam: runs after staged state is placed, before the parity check. */
   afterPlacement?: (root: string) => void;
+  /** Test seam: runs at the start of the placement window, before the first no-replace write. */
+  beforePlacement?: (root: string) => void;
 };
 
 export function migrateCleanroom(options: { root: string; dryRun?: boolean; json?: boolean; legacyCli?: string; _hooks?: MigrateTestHooks }): MigrateResult {
@@ -353,27 +379,7 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
     };
 
     const configAction = planShipGateConfig(root);
-    if (options.dryRun) {
-      planSummary();
-      if (configAction.kind === "ts-patch-required") {
-        line(`ShipGate config is TypeScript/JavaScript (${path.basename(configAction.file)}): a real run would write a proposed patch to ${CONFIG_PATCH_FILE} and stop.`);
-      }
-      line("Dry run: no changes were made.");
-      return done(0);
-    }
-    if (configAction.kind === "ts-patch-required") {
-      const patchPath = path.join(root, CONFIG_PATCH_FILE);
-      fs.mkdirSync(path.dirname(patchPath), { recursive: true });
-      fs.writeFileSync(
-        patchPath,
-        JSON.stringify({ policies: { cleanroom: POLICY_CONFIG_KEY } }, null, 2) + "\n",
-      );
-      line(`ShipGate config is TypeScript/JavaScript (${path.basename(configAction.file)}) and cannot be edited safely by heuristics.`);
-      line(`A proposed patch was written to ${CONFIG_PATCH_FILE}. Merge policies.cleanroom into the config, then re-run this command.`);
-      return done(2);
-    }
-
-    // 2. Containment: never write through a symlinked ancestor, for every path
+    // Containment: never write through a symlinked ancestor, for every path
     // this command creates or overwrites.
     const lockAbs = path.join(root, LOCK_FILE);
     const stagingAbs = path.join(root, STAGING_DIR);
@@ -384,6 +390,14 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       assertContainedAncestors(root, path.relative(root, abs));
     }
 
+    if (options.dryRun) {
+      planSummary();
+      if (configAction.kind === "ts-patch-required") {
+        line(`ShipGate config is TypeScript/JavaScript (${path.basename(configAction.file)}): a real run would write a proposed patch to ${CONFIG_PATCH_FILE} and stop.`);
+      }
+      line("Dry run: no changes were made.");
+      return done(0);
+    }
     // The legacy CLI is needed for the parity proof; fail before any write if
     // it is not installed (e.g. a production install without devDependencies).
     const legacyCli = resolveLegacyCli(options.legacyCli);
@@ -392,9 +406,12 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         ? `Cannot prove parity: --legacy-cli path does not exist or is not a file (${options.legacyCli}).`
         : "Cannot prove parity: no legacy Cleanroom CLI found. Pass --legacy-cli <path-to-cli.mjs>, install @avant-iconic/cleanroom alongside ShipGate, or put greenroom on PATH.");
     }
-
-    // 3. Fast path: report an obviously present lock (read-only, no mutation).
-    if (fs.existsSync(lockAbs)) return fail(ctx, `An active migration lock exists: ${LOCK_FILE}. Refusing to start another migration.`);
+    let comparator: ComparatorInfo;
+    try {
+      comparator = probeComparator(legacyCli);
+    } catch (error) {
+      return fail(ctx, error instanceof Error ? error.message : String(error));
+    }
 
     // Ownership-tracked rollback: only resources this process created are
     // removed, and only when this process holds the lock. A process that loses
@@ -404,14 +421,41 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
     let placedConfigOwned = false;
     let placedStateOwned = false;
     let shipgateConfigOwned = false;
-    const originalShipgateConfig = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
+    const placedStateFiles: string[] = [];
+    const placedStateDirs: string[] = [];
+    let originalShipgateConfig: Buffer | null = null; // buffered under the lock
+    let writtenShipgateConfig: Buffer | null = null; // exact bytes this process placed
+    let shipgateConfigConflict = false;
     const rollback = () => {
       if (!lockOwned) return;
-      if (placedStateOwned) fs.rmSync(placedState, { recursive: true, force: true });
+      if (placedStateOwned) {
+        // Ownership-safe cleanup: remove only the files and directories this
+        // process placed; anything foreign left behind keeps the directory.
+        for (const f of placedStateFiles) fs.rmSync(f, { force: true });
+        for (const d of [...placedStateDirs].reverse()) {
+          try {
+            fs.rmdirSync(d);
+          } catch {
+            // non-empty (foreign content) or already gone: leave it
+          }
+        }
+        try {
+          fs.rmdirSync(placedState);
+        } catch {
+          // foreign content remains: leave the directory in place
+        }
+      }
       if (placedConfigOwned) fs.rmSync(placedConfig, { force: true });
       if (shipgateConfigOwned) {
-        if (originalShipgateConfig) fs.writeFileSync(shipgateConfigAbs, originalShipgateConfig);
-        else fs.rmSync(shipgateConfigAbs, { force: true });
+        // Conflict-safe restore: only revert bytes this process wrote. If the
+        // file changed after our write (external edit), leave it untouched.
+        const current = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
+        if (current !== null && writtenShipgateConfig !== null && current.equals(writtenShipgateConfig)) {
+          if (originalShipgateConfig) fs.writeFileSync(shipgateConfigAbs, originalShipgateConfig);
+          else fs.rmSync(shipgateConfigAbs, { force: true });
+        } else {
+          shipgateConfigConflict = true;
+        }
       }
       if (stagingOwned) fs.rmSync(stagingAbs, { recursive: true, force: true });
       fs.rmSync(lockAbs, { force: true });
@@ -467,6 +511,23 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         return fail(ctx, `Migrated destination appeared while acquiring the lock (${MIGRATED_CONFIG_FILE} / ${MIGRATED_STATE_DIR}/). Refusing to combine two state roots.`);
       }
       if (fs.existsSync(stagingAbs)) fs.rmSync(stagingAbs, { recursive: true, force: true }); // interrupted staging recovery, under lock
+      originalShipgateConfig = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
+
+      // A proposed patch for TypeScript/JavaScript configs is a write too: it
+      // happens under containment and the lock, never before them.
+      if (configAction.kind === "ts-patch-required") {
+        const patchPath = path.join(root, CONFIG_PATCH_FILE);
+        fs.mkdirSync(path.dirname(patchPath), { recursive: true });
+        fs.writeFileSync(
+          patchPath,
+          JSON.stringify({ policies: { cleanroom: POLICY_CONFIG_KEY } }, null, 2) + "\n",
+        );
+        fs.rmSync(lockAbs, { force: true });
+        lockOwned = false;
+        line(`ShipGate config is TypeScript/JavaScript (${path.basename(configAction.file)}) and cannot be edited safely by heuristics.`);
+        line(`A proposed patch was written to ${CONFIG_PATCH_FILE}. Merge policies.cleanroom into the config, then re-run this command.`);
+        return done(2);
+      }
 
       // 6. Stage a full-root mirror containing only inventoried bytes.
       copyStateInto(root, stagingAbs, sourceInventory);
@@ -503,14 +564,18 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       // repository content: parity compares identical findings, and no marker
       // exists until the migration is committed.
       const stagedStateRoot = path.join(stagingAbs, ".shipgate", "policies");
+      const prevStateRoot = process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
+      const prevStateRootFor = process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
       process.env.SHIPGATE_CLEANROOM_STATE_ROOT = stagedStateRoot;
       process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR = root;
       let ported: ReturnType<typeof runCleanroomCli>;
       try {
         ported = runCleanroomCli(["check", "--json", "--root", root], { cwd: root });
       } finally {
-        delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
-        delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
+        if (prevStateRoot === undefined) delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
+        else process.env.SHIPGATE_CLEANROOM_STATE_ROOT = prevStateRoot;
+        if (prevStateRootFor === undefined) delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
+        else process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR = prevStateRootFor;
       }
       if (legacy.status !== ported.exitCode || canonicalJson(legacy.stdout) !== canonicalJson(ported.stdout)) {
         throw new Error(`Parity mismatch before placement: legacy exit ${String(legacy.status)} vs migrated exit ${ported.exitCode}.`);
@@ -528,19 +593,73 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       }
 
       // 10. Place the migration, rechecking each destination under the lock.
+      // CAS: if we will write shipgate.config.json, its current content must
+      // still be exactly what was staged from; an external edit is a conflict.
+      if (configAction.kind === "json-merge" || configAction.kind === "none-present-create-json") {
+        const currentConfig = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
+        const stagedFrom = originalShipgateConfig;
+        if ((currentConfig === null) !== (stagedFrom === null) || (currentConfig !== null && stagedFrom !== null && !currentConfig.equals(stagedFrom))) {
+          throw new Error("shipgate.config.json changed during the migration (external edit). Refusing to overwrite it; re-run to migrate against the current config.");
+        }
+      }
+      options._hooks?.beforePlacement?.(root);
+
       fs.mkdirSync(path.dirname(placedConfig), { recursive: true });
-      if (fs.existsSync(placedConfig)) throw new Error(`Destination appeared during migration: ${MIGRATED_CONFIG_FILE}.`);
-      fs.renameSync(path.join(stagingAbs, MIGRATED_CONFIG_FILE), placedConfig);
+      // No-replace placement: a plain exists-then-rename window would let a
+      // concurrent writer's file be silently overwritten. COPYFILE_EXCL and a
+      // non-recursive mkdir fail atomically instead.
+      try {
+        fs.copyFileSync(path.join(stagingAbs, MIGRATED_CONFIG_FILE), placedConfig, fs.constants.COPYFILE_EXCL);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Destination appeared during migration: ${MIGRATED_CONFIG_FILE}.`);
+        throw error;
+      }
       placedConfigOwned = true;
       const stagedState = path.join(stagingAbs, MIGRATED_STATE_DIR);
       if (fs.existsSync(stagedState)) {
-        if (fs.existsSync(placedState)) throw new Error(`Destination appeared during migration: ${MIGRATED_STATE_DIR}/.`);
-        fs.renameSync(stagedState, placedState);
+        try {
+          fs.mkdirSync(placedState); // atomic: fails EEXIST if anything already sits there
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Destination appeared during migration: ${MIGRATED_STATE_DIR}/.`);
+          throw error;
+        }
         placedStateOwned = true;
+        const placeTree = (srcDir: string, dstDir: string): void => {
+          for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+            const src = path.join(srcDir, entry.name);
+            const dst = path.join(dstDir, entry.name);
+            if (entry.isDirectory()) {
+              try {
+                fs.mkdirSync(dst);
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+                // EEXIST inside our just-created tree means a foreign writer.
+                throw new Error(`Destination appeared during migration: ${path.relative(root, dst)}/.`);
+              }
+              placedStateDirs.push(dst);
+              placeTree(src, dst);
+            } else {
+              try {
+                fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL);
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Destination appeared during migration: ${path.relative(root, dst)}.`);
+                throw error;
+              }
+              placedStateFiles.push(dst);
+            }
+          }
+        };
+        placeTree(stagedState, placedState);
       }
       const stagedConfig = path.join(stagingAbs, "shipgate.config.json");
       if (fs.existsSync(stagedConfig)) {
-        fs.renameSync(stagedConfig, shipgateConfigAbs); // intentional overwrite; original buffered above
+        // CAS again immediately before the intentional overwrite.
+        const currentConfig = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
+        if ((currentConfig === null) !== (originalShipgateConfig === null) || (currentConfig !== null && originalShipgateConfig !== null && !currentConfig.equals(originalShipgateConfig))) {
+          throw new Error("shipgate.config.json changed during the migration (external edit). Refusing to overwrite it; re-run to migrate against the current config.");
+        }
+        writtenShipgateConfig = fs.readFileSync(stagedConfig);
+        fs.copyFileSync(stagedConfig, shipgateConfigAbs);
         shipgateConfigOwned = true;
       }
 
@@ -557,7 +676,7 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         version: 1,
         managedFiles,
         sourceCommit: spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim() || null,
-        tools: { shipgate: packageJson.version, cleanroomPolicy: "1.1.0" },
+        tools: { shipgate: packageJson.version, cleanroomPolicy: comparator.version, comparator },
         sourceInventory,
         stagedInventory,
         parityDigest,
@@ -582,7 +701,10 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       return done(0);
     } catch (error) {
       rollback();
-      return fail(ctx, `Migration failed and was rolled back: ${error instanceof Error ? error.message : String(error)}`);
+      const conflictNote = shipgateConfigConflict
+        ? " Note: shipgate.config.json was changed externally after this migration wrote it; it was left untouched (it may still enable policies.cleanroom)."
+        : "";
+      return fail(ctx, `Migration failed and was rolled back: ${error instanceof Error ? error.message : String(error)}${conflictNote}`);
     }
   } catch (error) {
     return fail(ctx, error instanceof Error ? error.message : String(error));
