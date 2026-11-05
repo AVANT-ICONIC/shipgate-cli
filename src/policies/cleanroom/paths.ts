@@ -54,6 +54,11 @@ export function resolveStateMode(root: string): StateMode {
  * unchanged in both modes.
  */
 export function resolveStateRel(root: string, logicalPath: string): string {
+  // While the migration state-root override is active, relative mapping keeps
+  // legacy semantics: current-state I/O goes through resolveStatePath (which
+  // honors the override), and git-history candidates keep the repository's
+  // actual layout. resolveStateMode would throw on the mid-migration dual root.
+  if (stateRootOverride(root)) return logicalPath;
   if (resolveStateMode(root) === "migrated") {
     if (logicalPath === LEGACY_CONFIG_FILE) return MIGRATED_CONFIG_FILE;
     if (logicalPath === LEGACY_STATE_DIR) return MIGRATED_STATE_DIR;
