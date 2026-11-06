@@ -122,6 +122,10 @@ export function lastStepFor(journal: Journal, op: string): JournalStep | null {
  * run published bytes that must be preserved and journaled, never removed. */
 export const PUBLIC_OPS = ["publish-config", "publish-state", "config-commit", "marker-commit"] as const;
 
-export function hasCompletedPublicMutation(journal: Journal): boolean {
-  return journal.steps.some((s) => (PUBLIC_OPS as readonly string[]).includes(s.op) && s.status === "done");
+/** Any recorded step (begin OR done) for a public op: evidence that
+ * publication may have begun. A begin without its done still explains
+ * published bytes, so recovery and failure classification must treat it as
+ * publication evidence - begin is not completion, but it is explanation. */
+export function hasAnyPublicationStep(journal: Journal): boolean {
+  return journal.steps.some((s) => (PUBLIC_OPS as readonly string[]).includes(s.op));
 }
