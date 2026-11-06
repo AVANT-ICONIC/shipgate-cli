@@ -16,10 +16,15 @@ exit 2, no automatic merge) is a pending spec decision and may change.
 - Old and new `check --json` must produce identical findings and exit codes
   before anything is published.
 - Publication uses exclusive-create operations only (O_EXCL copies, mkdir,
-  hardlinks). Nothing pre-existing is overwritten or deleted: not your
-  files, and not bytes the migration itself already published.
+  hardlinks). No public path is overwritten. On handled failures, published
+  state and your data are preserved; cleanup removes only journal-proven,
+  inode-verified private scratch (this run's staging, temps, journal, and an
+  empty reservation directory whose identity matches its journal record).
 - The migration marker (`.shipgate/policies/cleanroom/migration.json`) is
-  the single commit point. It is written last, atomically, and a re-run of a
+  the commit point. It is written last, via an atomic no-replace link. For
+  policy commands, the marker file's existence alone selects the migrated
+  layout; the migrate command itself only treats a marker with status
+  "completed" and a parity digest as proof of completion, and a re-run of a
   completed identical migration is a no-op.
 - Every step is recorded in a durable per-run journal under
   `.shipgate/policies/` before and after it happens.
@@ -28,13 +33,19 @@ exit 2, no automatic merge) is a pending spec decision and may change.
 
 - There is no multi-file atomic commit. A crash (including power loss) can
   leave a partially published destination.
-- The lock file serializes cooperative migrators only. It cannot stop an
-  editor, script, or operator that modifies files directly; against those,
-  the migration preserves bytes and reports conflicts instead of racing.
+- The lock file serializes cooperative migrators only. It cannot fence an
+  editor, script, or operator that modifies files directly. Conflicts the
+  migration detects are preserved and reported, but there is no byte-level
+  guarantee against a non-cooperating writer (for example an in-place edit
+  of an already published file).
 - A stale lock is never reclaimed automatically, even when its recorded
   process is dead.
 
 ## If a migration is interrupted
+
+This applies while no completed marker exists. (Once the marker is complete,
+a re-run verifies the destination, reports any leftover residue without
+deleting it, and returns 0 - even if a stale lock is present.)
 
 1. A re-run refuses while a lock file exists and prints a diagnosis: the
    recorded pid, start time, whether that process is still alive, and the
@@ -63,9 +74,14 @@ removing the partial destination.
 
 - No `shipgate.config.*` exists: one is created with `policies.cleanroom`.
 - `shipgate.config.json` exists (pending spec decision): the migration
-  writes a proposed merged config to
-  `.shipgate/policies/cleanroom.config-patch.json` and exits with code 2.
-  Review it, replace `shipgate.config.json` with it, and re-run.
-- TypeScript/JavaScript config: a proposed patch is written to the same
-  location; merge `policies.cleanroom` into the config and re-run.
+  writes a proposed merged config to `.shipgate/policies/cleanroom.config-patch.json`
+  and exits with code 2. If that path is already taken by different content,
+  a uniquely suffixed path is written instead - use the exact path the
+  command reports. Review the proposal, replace `shipgate.config.json` with
+  it, and re-run.
+- TypeScript/JavaScript config: a proposed patch is written (same path
+  rules); merge `policies.cleanroom` into your config and re-run. Known
+  limitation: a code config cannot be inspected safely, so the command stops
+  with the proposal again on every run, even after you merge - it does not
+  currently detect the added policy in a TypeScript/JavaScript config.
 - A config that already contains `policies.cleanroom` is left as is.
