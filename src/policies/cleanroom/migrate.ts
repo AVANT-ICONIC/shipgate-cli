@@ -14,6 +14,19 @@ import {
   MIGRATION_MARKER,
 } from "./paths.js";
 import { runCleanroomCli } from "./cli.js";
+import {
+  JOURNAL_PREFIX,
+  createJournal,
+  fsyncDir,
+  fsyncFile,
+  hasCompletedPublicMutation,
+  journalFileName,
+  lastStepFor,
+  listJournals,
+  readJournal,
+  recordStep,
+  type Journal,
+} from "./migrate-journal.js";
 
 /**
  * Spec issue #1 step 6: lossless migration of Cleanroom legacy state
@@ -24,13 +37,38 @@ import { runCleanroomCli } from "./cli.js";
  * boundary (src/commands/migrate.ts) assigns `process.exitCode`. Nothing
  * here writes to the console or terminates the process.
  *
- * Guarantees: legacy state is never deleted; any failure removes staging,
- * lock and any half-placed destination, then returns 2; a completed
- * identical migration re-run is a no-op; changed legacy source after a
- * completed migration is a conflict.
+ * Reviewed publication protocol (fail-closed, journaled, monotonic):
+ * - Legacy state is never deleted.
+ * - Every public path is created by an exclusive operation (O_EXCL copy,
+ *   mkdir, hardlink); nothing foreign is ever overwritten or deleted, and
+ *   content equality is never treated as ownership.
+ * - Every public mutation is recorded in a durable per-run journal (fsync of
+ *   file and parent directory) before it is attempted and after it lands.
+ * - A handled failure BEFORE any publication removes only private per-run
+ *   resources (staging, temps, journal) and releases the lock (spec 6.10).
+ * - A handled failure AFTER any publication preserves the published bytes and
+ *   the journal, removes staging/temps, and releases the lock; the error
+ *   names what was retained. Published bytes are never unpublished.
+ * - A process crash leaves everything as it was; the next run fails closed
+ *   on the stale lock with a diagnosis, and after the operator deliberately
+ *   removes the lock it resumes by re-staging a fresh snapshot and
+ *   byte-verifying every journaled piece.
+ * - A completed identical migration re-run is a no-op; changed legacy source
+ *   after a completed migration is a conflict.
  */
 
 const LOCK_FILE = ".shipgate/policies/.cleanroom-migrate.lock";
+const LEGACY_STAGING_DIR = ".shipgate/policies/.cleanroom-migrate.staging"; // pre-journal naming; migrator scratch only
+const STAGING_PREFIX = ".cleanroom-migrate.staging-";
+const CONFIG_BACKUP_FILE = ".shipgate/policies/.cleanroom-migrate.config-backup";
+const CONFIG_PATCH_FILE = ".shipgate/policies/cleanroom.config-patch.json";
+const POLICIES_DIR = ".shipgate/policies";
+const POLICY_CONFIG_KEY = { enabled: true, configFile: ".shipgate/policies/cleanroom.json" } as const;
+
+/** Test-only crash seam: SHIPGATE_CLEANROOM_MIGRATE_CRASH_AT names a
+ * boundary at which the process SIGKILLs itself, so tests exercise genuine
+ * process death at every publication boundary instead of simulated hooks. */
+const CRASH_ENV = "SHIPGATE_CLEANROOM_MIGRATE_CRASH_AT";
 
 /** The lock was lost to another migration between token phase-gates. */
 class LockLostError extends Error {
@@ -39,10 +77,6 @@ class LockLostError extends Error {
     this.name = "LockLostError";
   }
 }
-const CONFIG_BACKUP_FILE = ".shipgate/policies/.cleanroom-migrate.config-backup";
-const STAGING_DIR = ".shipgate/policies/.cleanroom-migrate.staging";
-const CONFIG_PATCH_FILE = ".shipgate/policies/cleanroom.config-patch.json";
-const POLICY_CONFIG_KEY = { enabled: true, configFile: ".shipgate/policies/cleanroom.json" } as const;
 
 export type InventoryEntry = { path: string; bytes: number; sha256: string };
 export type InventoryCounts = {
@@ -162,8 +196,8 @@ function walkFiles(root: string, rel: string, into: InventoryEntry[]): void {
     return;
   }
   if (stat.isDirectory()) {
-    for (const entry of fs.readdirSync(start, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-      walkFiles(root, path.join(rel, entry.name), into);
+    for (const entry of fs.readdirSync(start).sort((a, b) => a.localeCompare(b))) {
+      walkFiles(root, path.join(rel, entry), into);
     }
   }
 }
@@ -208,7 +242,7 @@ function treesEqual(a: string, b: string): boolean {
   if (ea.length !== eb.length) return false;
   for (let i = 0; i < ea.length; i += 1) {
     const fa = ea[i]!;
-    const fb = fb_of(eb, i);
+    const fb = eb[i]!;
     if (fa.name !== fb.name || fa.isDirectory() !== fb.isDirectory() || fa.isFile() !== fb.isFile()) return false;
     const pa = path.join(a, fa.name);
     const pb = path.join(b, fb.name);
@@ -222,7 +256,6 @@ function treesEqual(a: string, b: string): boolean {
   }
   return true;
 }
-function fb_of(eb: fs.Dirent[], i: number): fs.Dirent { return eb[i]!; }
 
 function inventoriesEqual(a: Inventory, b: Inventory): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
@@ -261,9 +294,8 @@ function planShipGateConfig(root: string): ShipGateConfigAction {
   for (const name of ["shipgate.config.ts", "shipgate.config.mts", "shipgate.config.js", "shipgate.config.mjs", "shipgate.config.cjs"]) {
     const file = path.join(root, name);
     if (fs.existsSync(file)) {
-      // Code configs cannot be edited safely by heuristics: check whether the
-      // policy is already wired by loading is out of scope here; require the
-      // human to apply a proposed patch instead.
+      // Code configs cannot be edited safely by heuristics: require the human
+      // to apply a proposed patch instead.
       return { kind: "ts-patch-required", file };
     }
   }
@@ -327,7 +359,10 @@ function resolveLegacyCli(explicit?: string): LegacyCli | null {
   return null;
 }
 
-
+/** A private per-run resource, identity-tracked at creation: cleanup removes
+ * it only when the path still holds the exact inode this run created, so an
+ * EEXIST collision or a foreign replacement is never deleted. */
+type PrivateResource = { abs: string; dev: number; ino: number; recursive: boolean };
 
 export type MigrateTestHooks = {
   /** Test seam: runs after staging is complete, before the staged re-inventory. */
@@ -338,6 +373,8 @@ export type MigrateTestHooks = {
   beforePlacement?: (root: string) => void;
   /** Test seam: runs immediately before the shipgate.config.json commit. */
   beforeConfigCommit?: (root: string) => void;
+  /** Test seam: runs after the original config was moved aside, before the EXCL refill. */
+  beforeConfigRefill?: (root: string) => void;
 };
 
 export function migrateCleanroom(options: { root: string; dryRun?: boolean; json?: boolean; legacyCli?: string; _hooks?: MigrateTestHooks }): MigrateResult {
@@ -345,12 +382,17 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
   const ctx: Ctx = { root, out: [], err: [] };
   const line = (text: string) => ctx.out.push(`${text}\n`);
   const done = (exitCode: 0 | 2): MigrateResult => ({ exitCode, stdout: ctx.out.join(""), stderr: ctx.err.join("") });
+  const crashAt = process.env[CRASH_ENV] ?? null;
+  const crashPoint = (name: string): void => {
+    if (crashAt === name) process.kill(process.pid, "SIGKILL");
+  };
 
   try {
     // 1. Validate exactly one complete legacy source.
     const legacyConfigAbs = path.join(root, LEGACY_CONFIG_FILE);
     const legacyStateAbs = path.join(root, LEGACY_STATE_DIR);
     const markerAbs = path.join(root, MIGRATION_MARKER);
+    const policiesDirAbs = path.join(root, POLICIES_DIR);
     const legacyPresent = fs.existsSync(legacyConfigAbs) || fs.existsSync(legacyStateAbs);
     const migratedPresent = fs.existsSync(path.join(root, MIGRATED_CONFIG_FILE)) || fs.existsSync(path.join(root, MIGRATED_STATE_DIR));
 
@@ -383,6 +425,19 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       if (!inventoriesEqual(marker.stagedInventory, destCurrent)) {
         return fail(ctx, `Migrated destination no longer matches the recorded migration (${MIGRATION_MARKER}): files were changed, added, or removed after migration. Refusing to guess; reconcile deliberately.`);
       }
+      // The migration is complete; leftover migrator scratch (journals,
+      // staging dirs) from a crash after the commit point is private per-run
+      // residue and is removed here. Public bytes are never touched.
+      for (const entry of fs.readdirSync(policiesDirAbs)) {
+        if (
+          entry.startsWith(JOURNAL_PREFIX) ||
+          entry.startsWith(STAGING_PREFIX) ||
+          entry === path.basename(LEGACY_STAGING_DIR) ||
+          entry === path.basename(LOCK_FILE)
+        ) {
+          fs.rmSync(path.join(policiesDirAbs, entry), { recursive: true, force: true });
+        }
+      }
       if (!legacyPresent) {
         line("Cleanroom policy state already migrated and verified; no legacy source remains. Nothing to do.");
         return done(0);
@@ -400,9 +455,11 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
     }
     // Malformed JSON/JSONL and symlink escapes fail here.
     const sourceInventory = inventoryState(root, LEGACY_CONFIG_FILE, LEGACY_STATE_DIR);
+    const sourceDigest = sha256(Buffer.from(JSON.stringify(sourceInventory)));
     // Config must parse as a legacy Cleanroom config object.
     readJsonFile(legacyConfigAbs, LEGACY_CONFIG_FILE);
 
+    const configAction = planShipGateConfig(root);
     const planSummary = () => {
       line(`Cleanroom migration plan for ${root}`);
       line(`  source: ${LEGACY_CONFIG_FILE} + ${LEGACY_STATE_DIR}/ (${sourceInventory.files.length} files, ${sourceInventory.files.reduce((n, f) => n + f.bytes, 0)} bytes)`);
@@ -410,15 +467,15 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       line(`  config: ${configAction.kind === "json-merge" ? "merge policies.cleanroom into shipgate.config.json" : configAction.kind === "already-present" ? "policies.cleanroom already configured" : "create shipgate.config.json with policies.cleanroom"}`);
     };
 
-    const configAction = planShipGateConfig(root);
     // Containment: never write through a symlinked ancestor, for every path
     // this command creates or overwrites.
     const lockAbs = path.join(root, LOCK_FILE);
-    const stagingAbs = path.join(root, STAGING_DIR);
     const placedConfig = path.join(root, MIGRATED_CONFIG_FILE);
     const placedState = path.join(root, MIGRATED_STATE_DIR);
     const shipgateConfigAbs = path.join(root, "shipgate.config.json");
     const configBackupAbs = path.join(root, CONFIG_BACKUP_FILE);
+    const runId = crypto.randomUUID();
+    const stagingAbs = path.join(policiesDirAbs, `${STAGING_PREFIX}${runId}`);
     for (const abs of [lockAbs, stagingAbs, placedConfig, placedState, shipgateConfigAbs, markerAbs, configBackupAbs, path.join(root, CONFIG_PATCH_FILE)]) {
       assertContainedAncestors(root, path.relative(root, abs));
     }
@@ -449,185 +506,197 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       return fail(ctx, error instanceof Error ? error.message : String(error));
     }
 
-    // Ownership-tracked rollback: only resources this process created are
-    // removed, and only when this process holds the lock. A process that loses
-    // the lock race owns nothing and must not touch the winner's files.
-    let lockOwned = false;
-    let stagingOwned = false;
-    let placedConfigOwned = false;
-    let placedStateOwned = false;
-    let placedStateRenamed = false; // only a renamed-in tree is ours to remove recursively
-    let shipgateConfigOwned = false;
-    let shipgateConfigWriteComplete = false;
-    let configBackupOwned = false;
-    let releaseLock: () => void = () => undefined; // bound after acquisition
-    let originalShipgateConfig: Buffer | null = null; // buffered under the lock
-    let writtenShipgateConfig: Buffer | null = null; // exact bytes this process placed
-    let shipgateConfigConflict = false;
-    const rollback = () => {
-      if (!lockOwned) return;
-      // Only a tree actually renamed in from verified staging is ours to
-      // remove wholesale. If the rename never happened (foreign content
-      // blocked it), the directory holds foreign bytes: remove it only when
-      // empty, leaving anything foreign untouched.
-      if (placedStateRenamed) fs.rmSync(placedState, { recursive: true, force: true });
-      else if (placedStateOwned) {
+    // Private per-run resources, identity-tracked: only the exact inodes this
+    // run created are ever removed. Anything else is preserved and reported.
+    const privateResources: PrivateResource[] = [];
+    const preservedPrivate: string[] = [];
+    const trackPrivate = (abs: string, recursive: boolean): void => {
+      const st = fs.lstatSync(abs);
+      privateResources.push({ abs, dev: st.dev, ino: st.ino, recursive });
+    };
+    const removePrivate = (res: PrivateResource): void => {
+      privateResources.splice(privateResources.indexOf(res), 1);
+      let st: fs.Stats;
+      try {
+        st = fs.lstatSync(res.abs);
+      } catch {
+        return; // already gone
+      }
+      if (st.dev !== res.dev || st.ino !== res.ino) {
+        preservedPrivate.push(res.abs); // foreign replacement: never deleted
+        return;
+      }
+      fs.rmSync(res.abs, { recursive: res.recursive, force: true });
+    };
+
+    // Journal writes rewrite the file via temp+rename, so the tracked
+    // identity must follow the current inode after every recorded step.
+    let journalAbs: string | null = null;
+    const journaled = (journal: Journal, step: Parameters<typeof recordStep>[2]): void => {
+      recordStep(policiesDirAbs, journal, step);
+      if (journalAbs !== null) {
+        const res = privateResources.find((r) => r.abs === journalAbs);
+        if (res) {
+          const st = fs.lstatSync(journalAbs);
+          res.dev = st.dev;
+          res.ino = st.ino;
+        }
+      }
+    };
+
+    // 2. Acquire the lock with a single exclusive create. Fail closed on any
+    // existing lock: no automatic reclaim, no tombstones. The refusal carries
+    // a full diagnosis; recovery is a deliberate operator act.
+    fs.mkdirSync(policiesDirAbs, { recursive: true });
+    const ourToken = crypto.randomUUID();
+    const lockPayload = () => JSON.stringify({ pid: process.pid, token: ourToken, startedAt: new Date().toISOString(), runId }) + "\n";
+    try {
+      fs.writeFileSync(lockAbs, lockPayload(), { flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let diagnosis = "unreadable lock file";
+      try {
+        const raw = fs.readFileSync(lockAbs, "utf8");
+        const held = JSON.parse(raw) as { pid?: number; startedAt?: string };
+        let liveness = "unknown";
+        if (typeof held.pid === "number" && held.pid > 0) {
+          try {
+            process.kill(held.pid, 0);
+            liveness = "process currently ALIVE";
+          } catch (signalError) {
+            liveness = (signalError as NodeJS.ErrnoException).code === "ESRCH" ? "process no longer running" : "process status not checkable";
+          }
+        }
+        diagnosis = `recorded pid ${String(held.pid)}, started ${held.startedAt ?? "unknown"}, ${liveness}`;
+      } catch {
+        // keep the generic diagnosis
+      }
+      const journals = listJournals(policiesDirAbs);
+      if (journals.length === 1) {
         try {
-          fs.rmdirSync(placedState);
+          const interrupted = readJournal(path.join(policiesDirAbs, journals[0]!));
+          const last = interrupted.steps[interrupted.steps.length - 1];
+          diagnosis += `; journal ${journals[0]} last step: ${last ? `${last.op} ${last.status}` : "none"}`;
         } catch {
-          // foreign content present: preserved
+          diagnosis += `; journal ${journals[0]} unreadable`;
         }
       }
-      if (placedConfigOwned) fs.rmSync(placedConfig, { force: true });
-      if (shipgateConfigOwned) {
-        // Conflict-safe restore: remove the file when it is exactly what this
-        // process wrote - or, after an interrupted write, a strict PREFIX of
-        // it (a partial copy is unambiguously ours). Anything else is a later
-        // external edit and is preserved.
-        const current = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
-        const isOurs = current !== null && writtenShipgateConfig !== null
-          && (current.equals(writtenShipgateConfig)
-            || (!shipgateConfigWriteComplete && current.length < writtenShipgateConfig.length && writtenShipgateConfig.subarray(0, current.length).equals(current)));
-        if (isOurs) {
-          fs.rmSync(shipgateConfigAbs, { force: true });
-          if (configBackupOwned) fs.renameSync(configBackupAbs, shipgateConfigAbs);
-          configBackupOwned = false;
-        } else {
-          shipgateConfigConflict = true; // leave the user's newer edit in place
+      return fail(ctx, `A migration lock is present: ${LOCK_FILE} (${diagnosis}). Refusing to start; no changes were made. ` +
+        `The lock serializes cooperative migrators; it is never reclaimed automatically. ` +
+        `After confirming no migration is running, remove the lock file deliberately and re-run: the run resumes from the durable journal, byte-verifying anything already published.`);
+    }
+    let lockOwned = true;
+    const releaseLock = () => {
+      if (!lockOwned) return;
+      // Remove only our own lock, verified by token.
+      try {
+        const raw = fs.readFileSync(lockAbs, "utf8");
+        const parsed = JSON.parse(raw) as { token?: string };
+        if (parsed.token === ourToken) {
+          fs.rmSync(lockAbs, { force: true });
+          fsyncDir(policiesDirAbs);
         }
-      } else if (configBackupOwned) {
-        // Failed between move-aside and fill: restore the original, unless a
-        // foreign file took the path (preserved, reported as a conflict).
-        if (!fs.existsSync(shipgateConfigAbs)) {
-          fs.renameSync(configBackupAbs, shipgateConfigAbs);
-        } else {
-          shipgateConfigConflict = true;
-        }
-        configBackupOwned = false;
+      } catch {
+        // already gone or unreadable: leave it
       }
-      if (stagingOwned) fs.rmSync(stagingAbs, { recursive: true, force: true });
-      releaseLock();
       lockOwned = false;
+    };
+    crashPoint("afterLock");
+
+    // Token phase-gate: before every mutation phase, prove we still hold the
+    // lock. On loss we freeze: no writes, no deletions. The token disciplines
+    // cooperative migrators only; it is not fencing against arbitrary editors.
+    const assertLockHeld = () => {
+      let raw: string | null = null;
+      try {
+        raw = fs.readFileSync(lockAbs, "utf8");
+      } catch {
+        raw = null;
+      }
+      if (raw === null) throw new LockLostError();
+      try {
+        if ((JSON.parse(raw) as { token?: string }).token !== ourToken) throw new LockLostError();
+      } catch (error) {
+        if (error instanceof LockLostError) throw error;
+        throw new LockLostError();
+      }
     };
 
     try {
-      // 4. Acquire the lock atomically; recover only a lock whose owner died.
-      // Stale reclamation is identity-verified: the lock's raw bytes are
-      // captured, the file is moved aside atomically, and only reclaimed when
-      // the moved-aside content still matches what was validated stale. A
-      // replacement lock from a new live owner is moved straight back.
-      fs.mkdirSync(path.dirname(lockAbs), { recursive: true });
-      const ourToken = crypto.randomUUID();
-      const lockPayload = () => JSON.stringify({ pid: process.pid, token: ourToken, startedAt: new Date().toISOString() }) + "\n";
-      let reclaimAttempt = 0;
-      const tryAcquire = (): boolean => {
-        try {
-          fs.writeFileSync(lockAbs, lockPayload(), { flag: "wx" });
-          return true;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          let raw: string;
-          try {
-            raw = fs.readFileSync(lockAbs, "utf8");
-          } catch (readError) {
-            if ((readError as NodeJS.ErrnoException).code === "ENOENT") return reclaimAttempt++ < 4 ? tryAcquire() : false;
-            return false; // unreadable: the holder may still be running
-          }
-          let held: { pid?: number };
-          try {
-            held = JSON.parse(raw) as { pid?: number };
-          } catch {
-            return false; // corrupt lock: cannot establish staleness safely
-          }
-          if (typeof held.pid !== "number" || held.pid <= 0) return false;
-          try {
-            process.kill(held.pid, 0); // alive (or EPERM: alive, not ours)
-            return false;
-          } catch (signalError) {
-            if ((signalError as NodeJS.ErrnoException).code !== "ESRCH") return false;
-          }
-          // Owner is dead. Reclaim by atomic move-aside with identity check.
-          // FAIL CLOSED on any doubt: a mismatched (someone else's) lock is
-          // never moved back over a possibly newer lock; it stays as a
-          // tombstone and this run refuses. The disturbed owner detects the
-          // loss at its next token phase-gate and freezes without writes.
-          const tombstone = `${lockAbs}.reclaim-${process.pid}-${reclaimAttempt}`;
-          try {
-            fs.renameSync(lockAbs, tombstone);
-          } catch (renameError) {
-            if ((renameError as NodeJS.ErrnoException).code === "ENOENT") return reclaimAttempt++ < 4 ? tryAcquire() : false;
-            throw renameError;
-          }
-          let movedRaw: string;
-          try {
-            movedRaw = fs.readFileSync(tombstone, "utf8");
-          } catch {
-            movedRaw = "";
-          }
-          if (movedRaw !== raw) {
-            return false; // tombstone left in place as evidence; never restored over a newer lock
-          }
-          fs.rmSync(tombstone, { force: true }); // verified-stale lock reclaimed
-          return reclaimAttempt++ < 4 ? tryAcquire() : false;
-        }
-      };
-      if (!tryAcquire()) {
-        return fail(ctx, `Another migration holds the lock: ${LOCK_FILE}. Refusing to start; no changes were made.`);
-      }
-      lockOwned = true;
-      releaseLock = () => {
-        // Remove only our own lock, verified by token.
-        try {
-          const raw = fs.readFileSync(lockAbs, "utf8");
-          const parsed = JSON.parse(raw) as { token?: string };
-          if (parsed.token === ourToken) fs.rmSync(lockAbs, { force: true });
-        } catch {
-          // already gone or unreadable: leave it
-        }
-      };
-
-      // Token phase-gate: before every mutation phase, prove we still hold
-      // the lock. On loss we freeze: no writes, no deletions - the next run
-      // recovers staging/partials under a firmly held lock.
-      const assertLockHeld = () => {
-        let raw: string | null = null;
-        try {
-          raw = fs.readFileSync(lockAbs, "utf8");
-        } catch {
-          raw = null;
-        }
-        if (raw === null) throw new LockLostError();
-        try {
-          if ((JSON.parse(raw) as { token?: string }).token !== ourToken) throw new LockLostError();
-        } catch (error) {
-          if (error instanceof LockLostError) throw error;
-          throw new LockLostError();
-        }
-      };
-
-      // 5. Revalidate under the owned lock: the destination and marker were
+      // 3. Revalidate under the owned lock: the destination and marker were
       // checked before acquisition and could have changed since.
       if (fs.existsSync(markerAbs)) {
-        rollback();
+        releaseLock();
         return fail(ctx, `A migration marker appeared at ${MIGRATION_MARKER} while acquiring the lock; another migration finished first. Re-run to verify its result.`);
       }
-      // A destination without a marker is either a crash remnant with its
-      // verified staging still present (resumable: publish is idempotent and
-      // every piece is byte-verified against staging) or foreign state.
-      let resuming = false;
-      if (fs.existsSync(placedConfig) || fs.existsSync(placedState)) {
-        if (!fs.existsSync(stagingAbs)) {
-          rollback();
-          return fail(ctx, `Ambiguous destination: migrated state exists (${MIGRATED_CONFIG_FILE} / ${MIGRATED_STATE_DIR}/) without a migration marker or staging to verify it against. Refusing to combine two state roots.`);
-        }
-        resuming = true;
+
+      // 4. Adopt exactly one durable journal, or create this run's. The
+      // journal is the audit and recovery record of every public mutation.
+      const journalNames = listJournals(policiesDirAbs);
+      let journal: Journal;
+      if (journalNames.length > 1) {
+        releaseLock();
+        return fail(ctx, `Multiple migration journals found (${journalNames.join(", ")}): ambiguous recovery state. Reconcile deliberately (inspect the journals and published state), then re-run.`);
       }
-      if (fs.existsSync(stagingAbs) && !resuming) fs.rmSync(stagingAbs, { recursive: true, force: true }); // interrupted staging recovery, under lock
-      for (const entry of fs.readdirSync(path.dirname(lockAbs))) {
-        if (entry.startsWith(".cleanroom-migrate.lock.reclaim-")) {
-          fs.rmSync(path.join(path.dirname(lockAbs), entry), { force: true }); // tombstone evidence from prior contention, cleared under a held lock
+      if (journalNames.length === 1) {
+        try {
+          journal = readJournal(path.join(policiesDirAbs, journalNames[0]!));
+        } catch (error) {
+          releaseLock();
+          return fail(ctx, `${error instanceof Error ? error.message : String(error)}. Reconcile deliberately, then re-run.`);
+        }
+        if (journal.sourceDigest !== sourceDigest) {
+          releaseLock();
+          return fail(ctx, `Legacy Cleanroom source changed since the interrupted migration recorded in ${journalNames[0]}. Refusing to resume against a different source; published pieces and the journal are preserved. Reconcile deliberately, then re-run.`);
+        }
+        journalAbs = path.join(policiesDirAbs, journalNames[0]!);
+        trackPrivate(journalAbs, false);
+        journaled(journal, { op: "resume-adopt", status: "done", detail: { pid: process.pid, runId } });
+      } else {
+        journal = createJournal(policiesDirAbs, runId, sourceDigest);
+        journalAbs = path.join(policiesDirAbs, journalFileName(runId));
+        trackPrivate(journalAbs, false);
+      }
+      crashPoint("afterJournalCreate");
+
+      // A destination without a marker is explained only by journaled
+      // publications of the interrupted run. Anything else is foreign state.
+      if ((fs.existsSync(placedConfig) || fs.existsSync(placedState)) && !hasCompletedPublicMutation(journal)) {
+        throw new Error(`Ambiguous destination: migrated state exists (${MIGRATED_CONFIG_FILE} / ${MIGRATED_STATE_DIR}/) without a migration marker or a journal recording its publication. Refusing to combine two state roots.`);
+      }
+
+      // Clean migrator scratch: the pre-journal fixed-name staging dir is
+      // migrator-private by definition; per-run staging dirs are removed only
+      // when the adopted journal records them with a matching identity.
+      for (const entry of fs.readdirSync(policiesDirAbs)) {
+        const abs = path.join(policiesDirAbs, entry);
+        if (entry === path.basename(LEGACY_STAGING_DIR)) {
+          fs.rmSync(abs, { recursive: true, force: true });
+          continue;
+        }
+        if (!entry.startsWith(STAGING_PREFIX)) continue;
+        const recorded = journal.steps.find(
+          (s) => s.op === "staging" && s.status === "done" && (s.detail as { staging?: string } | undefined)?.staging === entry,
+        );
+        if (!recorded) {
+          preservedPrivate.push(abs); // unknown provenance: preserved, reported
+          continue;
+        }
+        const detail = recorded.detail as { dev?: number; ino?: number } | undefined;
+        let st: fs.Stats | null = null;
+        try {
+          st = fs.lstatSync(abs);
+        } catch {
+          st = null;
+        }
+        if (st && detail && st.dev === detail.dev && st.ino === detail.ino) {
+          fs.rmSync(abs, { recursive: true, force: true });
+        } else if (st) {
+          preservedPrivate.push(abs); // identity mismatch: preserved, reported
         }
       }
+
+      // Config backup residue from a crash inside the held merge protocol.
       if (fs.existsSync(configBackupAbs)) {
         if (!fs.existsSync(shipgateConfigAbs)) {
           fs.renameSync(configBackupAbs, shipgateConfigAbs); // crashed between move-aside and fill
@@ -635,31 +704,51 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
           return fail(ctx, `A previous migration left a config backup at ${CONFIG_BACKUP_FILE} while shipgate.config.json exists. Reconcile the two deliberately, then re-run.`);
         }
       }
-      originalShipgateConfig = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
+      const originalShipgateConfig = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
 
       // A proposed patch for TypeScript/JavaScript configs is a write too: it
       // happens under containment and the lock, never before them.
       if (configAction.kind === "ts-patch-required") {
-        const patchPath = path.join(root, CONFIG_PATCH_FILE);
-        fs.mkdirSync(path.dirname(patchPath), { recursive: true });
-        fs.writeFileSync(
-          patchPath,
-          JSON.stringify({ policies: { cleanroom: POLICY_CONFIG_KEY } }, null, 2) + "\n",
-        );
+        const patchContent = JSON.stringify({ policies: { cleanroom: POLICY_CONFIG_KEY } }, null, 2) + "\n";
+        let patchPath = path.join(root, CONFIG_PATCH_FILE);
+        try {
+          fs.writeFileSync(patchPath, patchContent, { flag: "wx" });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          if (!fs.readFileSync(patchPath).equals(Buffer.from(patchContent))) {
+            // A foreign or edited patch occupies the path: keep it, write ours
+            // at a unique path instead of overwriting.
+            patchPath = path.join(policiesDirAbs, `cleanroom.config-patch-${runId}.json`);
+            fs.writeFileSync(patchPath, patchContent, { flag: "wx" });
+          }
+        }
+        journaled(journal, { op: "config", status: "done", detail: { kind: "ts-patch-required", patch: path.relative(root, patchPath) } });
+        // No publication happened: remove the journal and release the lock.
+        for (const res of [...privateResources]) removePrivate(res);
         releaseLock();
-        lockOwned = false;
         line(`ShipGate config is TypeScript/JavaScript (${path.basename(configAction.file)}) and cannot be edited safely by heuristics.`);
-        line(`A proposed patch was written to ${CONFIG_PATCH_FILE}. Merge policies.cleanroom into the config, then re-run this command.`);
+        line(`A proposed patch was written to ${path.relative(root, patchPath)}. Merge policies.cleanroom into the config, then re-run this command.`);
         return done(2);
       }
 
       assertLockHeld();
 
-      // 6. Stage a full-root mirror containing only inventoried bytes.
-      if (!resuming) {
-        copyStateInto(root, stagingAbs, sourceInventory);
-      }
-      stagingOwned = true;
+      // 5. Stage a FRESH full-root snapshot from the validated source, even
+      // when resuming: staged bytes are re-derived, never trusted from a
+      // previous run.
+      journaled(journal, { op: "staging", status: "begin" });
+      fs.mkdirSync(stagingAbs); // exclusive: a fresh uuid cannot collide
+      trackPrivate(stagingAbs, true);
+      const stagingStat = fs.lstatSync(stagingAbs);
+      journaled(journal, {
+        op: "staging",
+        status: "done",
+        detail: { staging: path.basename(stagingAbs), dev: stagingStat.dev, ino: stagingStat.ino },
+      });
+      crashPoint("afterStagingCreated");
+
+      journaled(journal, { op: "snapshot", status: "begin" });
+      copyStateInto(root, stagingAbs, sourceInventory);
       if (configAction.kind === "json-merge") {
         const data = readJsonFile(configAction.file, "shipgate.config.json") as Record<string, unknown>;
         const policies = { ...((data.policies as object) ?? {}), cleanroom: POLICY_CONFIG_KEY };
@@ -667,10 +756,11 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       } else if (configAction.kind === "none-present-create-json") {
         fs.writeFileSync(path.join(stagingAbs, "shipgate.config.json"), JSON.stringify({ policies: { cleanroom: POLICY_CONFIG_KEY } }, null, 2) + "\n");
       }
+      journaled(journal, { op: "config", status: "done", detail: { kind: configAction.kind } });
 
       options._hooks?.afterStaging?.(stagingAbs);
 
-      // 7. Re-inventory staging and require every byte hash and count to match.
+      // 6. Re-inventory staging and require every byte hash and count to match.
       const stagedInventory = inventoryState(stagingAbs, MIGRATED_CONFIG_FILE, MIGRATED_STATE_DIR);
       const rebasedSource: Inventory = {
         files: sourceInventory.files.map((f) => ({
@@ -683,51 +773,46 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       if (!inventoriesEqual(rebasedSource, stagedInventory)) {
         throw new Error("Staged copy failed verification: byte hashes or record counts do not match the legacy source.");
       }
+      journaled(journal, { op: "snapshot", status: "done", detail: { files: stagedInventory.files.length, bytes: stagedInventory.files.reduce((n, f) => n + f.bytes, 0) } });
+      crashPoint("afterSnapshot");
 
-      // 8. Parity BEFORE placement: legacy check against the real root vs the
+      // 7. Parity BEFORE placement: legacy check against the real root vs the
       // migrated dispatcher against the staging root. No provisional marker is
       // ever written; a marker only exists once migration is complete.
+      journaled(journal, { op: "parity", status: "begin" });
       const legacy = spawnSync(legacyCli.command, [...legacyCli.prefixArgs, "check", "--json", "--root", root], { encoding: "utf8" });
       // The ported side reads the STAGED state while scanning the REAL
       // repository content: parity compares identical findings, and no marker
       // exists until the migration is committed.
       const stagedStateRoot = path.join(stagingAbs, ".shipgate", "policies");
-      const prevStateRoot = process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
-      const prevStateRootFor = process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
-      process.env.SHIPGATE_CLEANROOM_STATE_ROOT = stagedStateRoot;
-      process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR = root;
-      let ported: ReturnType<typeof runCleanroomCli>;
-      try {
-        ported = runCleanroomCli(["check", "--json", "--root", root], { cwd: root });
-      } finally {
-        if (prevStateRoot === undefined) delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
-        else process.env.SHIPGATE_CLEANROOM_STATE_ROOT = prevStateRoot;
-        if (prevStateRootFor === undefined) delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
-        else process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR = prevStateRootFor;
-      }
+      const withStateRootOverride = <T>(fn: () => T): T => {
+        const prevStateRoot = process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
+        const prevStateRootFor = process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
+        process.env.SHIPGATE_CLEANROOM_STATE_ROOT = stagedStateRoot;
+        process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR = root;
+        try {
+          return fn();
+        } finally {
+          if (prevStateRoot === undefined) delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
+          else process.env.SHIPGATE_CLEANROOM_STATE_ROOT = prevStateRoot;
+          if (prevStateRootFor === undefined) delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
+          else process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR = prevStateRootFor;
+        }
+      };
+      const ported = withStateRootOverride(() => runCleanroomCli(["check", "--json", "--root", root], { cwd: root }));
       if (legacy.status !== ported.exitCode || canonicalJson(legacy.stdout) !== canonicalJson(ported.stdout)) {
         throw new Error(`Parity mismatch before placement: legacy exit ${String(legacy.status)} vs migrated exit ${ported.exitCode}.`);
       }
       const parityDigest = sha256(Buffer.from(canonicalJson(legacy.stdout)));
+      journaled(journal, { op: "parity", status: "done", detail: { parityDigest, comparator } });
+      crashPoint("afterParity");
 
       // Managed files are read from the verified staged config under the same
       // state-root override (a resumed migration can already have a published
       // destination, and dual-root resolution would refuse here).
-      const prevStateRoot2 = process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
-      const prevStateRootFor2 = process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
-      process.env.SHIPGATE_CLEANROOM_STATE_ROOT = stagedStateRoot;
-      process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR = root;
-      let managedFiles: ManagedFileEntry[];
-      try {
-        managedFiles = inventoryManagedFiles(root);
-      } finally {
-        if (prevStateRoot2 === undefined) delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT;
-        else process.env.SHIPGATE_CLEANROOM_STATE_ROOT = prevStateRoot2;
-        if (prevStateRootFor2 === undefined) delete process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR;
-        else process.env.SHIPGATE_CLEANROOM_STATE_ROOT_FOR = prevStateRootFor2;
-      }
+      const managedFiles = withStateRootOverride(() => inventoryManagedFiles(root));
 
-      // 9. Commit check: the legacy source must not have changed since staging;
+      // 8. Commit check: the legacy source must not have changed since staging;
       // otherwise the verified copy is stale and nothing may be placed.
       if (!inventoriesEqual(sourceInventory, inventoryState(root, LEGACY_CONFIG_FILE, LEGACY_STATE_DIR))) {
         throw new Error("Legacy source changed during the migration; refusing to commit a stale copy. Re-run to migrate the current state.");
@@ -735,14 +820,15 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
 
       assertLockHeld();
 
-      // 10. Publish the migration. Genuine boundary: POSIX has no multi-file
-      // atomic commit, so publication is built from single-syscall atomic
-      // pieces - a directory rename for the whole state tree, a hardlink for
-      // each file - and any crash between them is recovered by re-running:
-      // publish is idempotent and every already-placed piece is byte-verified
-      // against the verified staging mirror. The one true overwrite, an
-      // existing shipgate.config.json, uses the move-aside backup protocol.
+      // 9. Publish. Genuine boundary: POSIX has no multi-file atomic commit,
+      // so publication is a monotonic sequence of single-syscall exclusive
+      // creates, each journaled before and after. A crash between them is
+      // recovered by re-running: every already-placed piece is byte-verified
+      // against the fresh staging snapshot and adopted, never overwritten.
+      // Published pieces are NEVER removed on failure.
+      journaled(journal, { op: "publish-config", status: "begin" });
       options._hooks?.beforePlacement?.(root);
+      crashPoint("beforePublishConfig");
       fs.mkdirSync(path.dirname(placedConfig), { recursive: true });
 
       // Migrated config file: materialize in a temp file, then hardlink into
@@ -752,100 +838,129 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         if (!fs.readFileSync(placedConfig).equals(fs.readFileSync(stagedConfigFile))) {
           throw new Error(`Destination ${MIGRATED_CONFIG_FILE} differs from the verified staged copy. Refusing to overwrite foreign content.`);
         }
-        placedConfigOwned = true; // our own earlier publication, byte-verified
       } else {
-        const configTemp = `${placedConfig}.tmp-${process.pid}`;
+        const configTemp = `${placedConfig}.tmp-${runId}`;
         try {
           fs.copyFileSync(stagedConfigFile, configTemp, fs.constants.COPYFILE_EXCL);
+          trackPrivate(configTemp, false);
           fs.linkSync(configTemp, placedConfig);
-          placedConfigOwned = true;
+          fsyncFile(placedConfig);
+          fsyncDir(path.dirname(placedConfig));
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Destination appeared during migration: ${MIGRATED_CONFIG_FILE}.`);
-          placedConfigOwned = fs.existsSync(placedConfig); // defensive: failed link leaves nothing
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            // Someone else placed the path (or the temp) during publication.
+            throw new Error(`Destination appeared during migration: ${MIGRATED_CONFIG_FILE}.`);
+          }
           throw error;
         } finally {
-          fs.rmSync(configTemp, { force: true });
+          const tempRes = privateResources.find((r) => r.abs === configTemp);
+          if (tempRes) removePrivate(tempRes); // only our own EXCL-created temp is removed
         }
       }
+      journaled(journal, { op: "publish-config", status: "done", path: MIGRATED_CONFIG_FILE, sha256: sha256(fs.readFileSync(placedConfig)) });
+      crashPoint("afterPublishConfig");
 
-      // State tree: one atomic directory rename. We first mkdir the
-      // destination (fails EEXIST on anything foreign); the rename then
-      // replaces only our own empty directory and fails ENOTEMPTY if foreign
-      // content lands inside it, so publication is all-or-nothing.
+      // State tree: one atomic directory rename onto our own reservation. We
+      // first mkdir the destination (fails EEXIST on anything foreign); the
+      // rename then replaces only our own empty directory and fails ENOTEMPTY
+      // if foreign content lands inside it, which is preserved, never removed.
       const stagedState = path.join(stagingAbs, MIGRATED_STATE_DIR);
+      journaled(journal, { op: "publish-state", status: "begin" });
       if (fs.existsSync(stagedState)) {
+        let adoptedState = false;
         if (fs.existsSync(placedState)) {
-          if (fs.readdirSync(placedState).length === 0 && fs.lstatSync(placedState).isDirectory()) {
-            fs.rmdirSync(placedState); // our own crash remnant: publish fresh below
+          const placedStat = fs.lstatSync(placedState);
+          if (!placedStat.isDirectory()) {
+            throw new Error(`Destination ${MIGRATED_STATE_DIR} exists and is not a directory. Refusing to overwrite foreign content.`);
+          }
+          if (fs.readdirSync(placedState).length === 0) {
+            // An empty directory holds no bytes. It is removed only when the
+            // journal proves it is our own reservation: a recorded reservation
+            // with a matching identity, or a reservation begin whose done was
+            // lost to a crash inside the reservation window.
+            const reservation = lastStepFor(journal, "state-reservation");
+            const identity = reservation?.detail as { dev?: number; ino?: number } | undefined;
+            const provenReservation =
+              (reservation?.status === "done" && identity?.dev === placedStat.dev && identity?.ino === placedStat.ino) ||
+              reservation?.status === "begin";
+            if (!provenReservation) {
+              throw new Error(`Destination ${MIGRATED_STATE_DIR}/ is an empty directory with no journaled reservation. Refusing to remove what may be foreign; remove it deliberately and re-run.`);
+            }
+            fs.rmdirSync(placedState);
           } else if (treesEqual(stagedState, placedState)) {
-            placedStateOwned = true;
-            placedStateRenamed = true; // byte-verified as exactly the staged tree
+            adoptedState = true; // byte-verified as exactly the staged tree
           } else {
             throw new Error(`Destination ${MIGRATED_STATE_DIR}/ differs from the verified staged copy. Refusing to overwrite foreign content.`);
           }
         }
-        if (!placedStateOwned) {
+        if (!adoptedState) {
+          journaled(journal, { op: "state-reservation", status: "begin" });
           try {
             fs.mkdirSync(placedState);
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Destination appeared during migration: ${MIGRATED_STATE_DIR}/.`);
             throw error;
           }
-          placedStateOwned = true;
+          const reservationStat = fs.lstatSync(placedState);
+          journaled(journal, { op: "state-reservation", status: "done", detail: { dev: reservationStat.dev, ino: reservationStat.ino } });
+          crashPoint("afterStateReservation");
           try {
             fs.renameSync(stagedState, placedState);
-            placedStateRenamed = true;
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === "ENOTEMPTY" || (error as NodeJS.ErrnoException).code === "EEXIST") {
-              throw new Error(`Foreign content appeared inside ${MIGRATED_STATE_DIR}/ during publication; refusing to continue.`);
+              throw new Error(`Foreign content appeared inside ${MIGRATED_STATE_DIR}/ during publication; it was preserved, not removed. Reconcile deliberately, then re-run.`);
             }
             throw error;
           }
+          fsyncDir(path.dirname(placedState));
         }
       }
+      journaled(journal, { op: "publish-state", status: "done", path: MIGRATED_STATE_DIR });
+      crashPoint("afterPublishState");
 
       const stagedConfig = path.join(stagingAbs, "shipgate.config.json");
       if (fs.existsSync(stagedConfig)) {
         assertLockHeld();
+        journaled(journal, { op: "config-commit", status: "begin" });
         options._hooks?.beforeConfigCommit?.(root);
-        writtenShipgateConfig = fs.readFileSync(stagedConfig);
+        crashPoint("beforeConfigCommit");
+        const writtenShipgateConfig = fs.readFileSync(stagedConfig);
         const currentConfig = fs.existsSync(shipgateConfigAbs) ? fs.readFileSync(shipgateConfigAbs) : null;
         if (currentConfig !== null && currentConfig.equals(writtenShipgateConfig)) {
           // A previous crashed run already committed these exact bytes.
-          shipgateConfigOwned = true;
         } else if (configAction.kind === "none-present-create-json") {
-          // New file: EXCL create — a foreign config appearing at the last
+          // New file: EXCL create - a foreign config appearing at the last
           // instant is a conflict, never an overwrite.
           try {
+            options._hooks?.beforeConfigRefill?.(root);
             fs.copyFileSync(stagedConfig, shipgateConfigAbs, fs.constants.COPYFILE_EXCL);
-            shipgateConfigOwned = true;
-            shipgateConfigWriteComplete = true;
+            fsyncFile(shipgateConfigAbs);
+            fsyncDir(root);
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === "EEXIST") {
               throw new Error("shipgate.config.json appeared during the migration (external write). Refusing to overwrite it; re-run to migrate against the current config.");
             }
-            shipgateConfigOwned = fs.existsSync(shipgateConfigAbs); // partial copy: removed by prefix check in rollback
-            throw error;
+            throw new Error(`Failed to write shipgate.config.json; any partial file was left in place deliberately. Reconcile and re-run. (${error instanceof Error ? error.message : String(error)})`);
           }
         } else {
-          // Merge: move the original aside atomically, verify the moved-aside
-          // bytes are exactly what was staged from (an edit racing the compare
+          // Merge (held behavior pending the owner decision on spec 6.6):
+          // move the original aside atomically, verify the moved-aside bytes
+          // are exactly what was staged from (an edit racing the compare
           // travels with the move and is caught), then EXCL-fill the path.
           if (currentConfig === null || originalShipgateConfig === null || !currentConfig.equals(originalShipgateConfig)) {
             throw new Error("shipgate.config.json changed during the migration (external edit). Refusing to overwrite it; re-run to migrate against the current config.");
           }
           fs.renameSync(shipgateConfigAbs, configBackupAbs);
-          configBackupOwned = true;
           const movedAside = fs.readFileSync(configBackupAbs);
           if (!movedAside.equals(originalShipgateConfig)) {
             fs.renameSync(configBackupAbs, shipgateConfigAbs); // put the foreign edit back
-            configBackupOwned = false;
             throw new Error("shipgate.config.json changed during the migration (external edit). Refusing to overwrite it; re-run to migrate against the current config.");
           }
           try {
+            options._hooks?.beforeConfigRefill?.(root);
             fs.copyFileSync(stagedConfig, shipgateConfigAbs, fs.constants.COPYFILE_EXCL);
-            shipgateConfigOwned = true;
-            shipgateConfigWriteComplete = true;
+            fsyncFile(shipgateConfigAbs);
+            fsyncDir(root);
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === "EEXIST") {
               // A foreign file took the path while the original was aside:
@@ -853,24 +968,26 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
               // config at a unique backup path, and report the conflict.
               const backupKeep = `${shipgateConfigAbs}.migration-backup-${Date.now()}-${process.pid}`;
               fs.renameSync(configBackupAbs, backupKeep);
-              configBackupOwned = false;
               throw new Error(`shipgate.config.json appeared during the migration (external write). The foreign file was left untouched at shipgate.config.json; the original config was kept at ${path.basename(backupKeep)}. Reconcile deliberately, then re-run.`);
             }
-            shipgateConfigOwned = fs.existsSync(shipgateConfigAbs); // partial copy: removed by prefix check in rollback
-            throw error;
+            throw new Error(`Failed to write shipgate.config.json after moving the original aside; the original is preserved at ${CONFIG_BACKUP_FILE}. Reconcile and re-run. (${error instanceof Error ? error.message : String(error)})`);
           }
+          fs.rmSync(configBackupAbs, { force: true });
         }
+        journaled(journal, { op: "config-commit", status: "done", path: "shipgate.config.json" });
+        crashPoint("afterConfigCommit");
       }
 
       options._hooks?.afterPlacement?.(root);
 
-      // 11. Verify the placed destination byte-for-byte before committing.
+      // 10. Verify the placed destination byte-for-byte before committing.
       const placedInventory = inventoryState(root, MIGRATED_CONFIG_FILE, MIGRATED_STATE_DIR);
       if (!inventoriesEqual(stagedInventory, placedInventory)) {
-        throw new Error("Placed destination failed verification: bytes differ from the verified staging copy.");
+        throw new Error("Placed destination failed verification: bytes differ from the verified staging copy. Published pieces are preserved and journaled; re-run to resume after reconciling.");
       }
 
-      // 12. Commit: write the finalized marker, then release staging and lock.
+      // 11. Commit point: write the finalized marker via temp + hardlink
+      // (atomic, no-replace), fsynced, then release private resources.
       const marker = {
         version: 1,
         managedFiles,
@@ -884,23 +1001,37 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         completedAt: new Date().toISOString(),
       };
       assertLockHeld();
+      journaled(journal, { op: "marker-commit", status: "begin" });
+      crashPoint("beforeMarkerCommit");
       fs.mkdirSync(path.dirname(markerAbs), { recursive: true });
-      const markerTemp = `${markerAbs}.tmp-${process.pid}`;
-      fs.writeFileSync(markerTemp, JSON.stringify(marker, null, 2) + "\n");
+      const markerTemp = `${markerAbs}.tmp-${runId}`;
+      fs.writeFileSync(markerTemp, JSON.stringify(marker, null, 2) + "\n", { flag: "wx" });
+      trackPrivate(markerTemp, false);
+      fsyncFile(markerTemp);
       try {
         fs.linkSync(markerTemp, markerAbs); // atomic no-replace commit point
+        fsyncFile(markerAbs);
+        fsyncDir(path.dirname(markerAbs));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new Error(`A marker appeared at ${MIGRATION_MARKER} during the commit; refusing to replace it. Published pieces are preserved and journaled; re-run to verify.`);
+        }
+        throw error;
       } finally {
-        fs.rmSync(markerTemp, { force: true });
+        const tempRes = privateResources.find((r) => r.abs === markerTemp);
+        if (tempRes) removePrivate(tempRes);
       }
-      fs.rmSync(stagingAbs, { recursive: true, force: true });
-      stagingOwned = false;
-      if (configBackupOwned) {
-        fs.rmSync(configBackupAbs, { force: true });
-        configBackupOwned = false;
-      }
-      releaseLock();
-      lockOwned = false;
+      journaled(journal, { op: "marker-commit", status: "done", path: MIGRATION_MARKER });
+      crashPoint("afterMarkerCommit");
 
+      // Success: remove private per-run resources (staging, journal, temps),
+      // identity-verified. Published bytes stay.
+      for (const res of [...privateResources]) removePrivate(res);
+      releaseLock();
+
+      if (preservedPrivate.length > 0) {
+        line(`Note: preserved foreign paths that collided with private scratch: ${preservedPrivate.map((p) => path.relative(root, p)).join(", ")}`);
+      }
       if (options.json) {
         line(JSON.stringify({ migrated: true, files: sourceInventory.files.length, bytes: sourceInventory.files.reduce((n, f) => n + f.bytes, 0), parityDigest }, null, 2));
       } else {
@@ -914,11 +1045,34 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         // Freeze: another migration owns the lock now; it owns cleanup/resume.
         return fail(ctx, "Migration lock lost to another migration; froze without further writes or cleanup. Re-run to resume safely.");
       }
-      rollback();
-      const conflictNote = shipgateConfigConflict
-        ? " Note: shipgate.config.json was changed externally after this migration wrote it; it was left untouched (it may still enable policies.cleanroom)."
-        : "";
-      return fail(ctx, `Migration failed and was rolled back: ${error instanceof Error ? error.message : String(error)}${conflictNote}`);
+      const journalRes = privateResources.find((r) => path.basename(r.abs).startsWith(JOURNAL_PREFIX));
+      let published = false;
+      if (journalRes !== undefined) {
+        try {
+          published = hasCompletedPublicMutation(readJournal(journalRes.abs));
+        } catch {
+          published = true; // unreadable journal after mutations: preserve, never risk cleanup
+        }
+      }
+      if (published) {
+        // After a public mutation: preserve published bytes and the journal,
+        // remove only staging/temps, release the lock.
+        for (const res of [...privateResources]) {
+          if (res === journalRes) continue;
+          removePrivate(res);
+        }
+        releaseLock();
+        const preservedNote = preservedPrivate.length > 0 ? ` Foreign paths preserved: ${preservedPrivate.map((p) => path.relative(root, p)).join(", ")}.` : "";
+        return fail(ctx, `Migration interrupted after partial publication: ${error instanceof Error ? error.message : String(error)}. ` +
+          `Published bytes were preserved and journaled (${path.basename(journalRes!.abs)}); nothing was rolled back.${preservedNote} ` +
+          `Re-run this command to resume: every journaled piece is byte-verified against a fresh snapshot.`);
+      }
+      // Before any public mutation (spec 6.10): remove staging, temps, journal
+      // and release the lock. Nothing public exists to preserve.
+      for (const res of [...privateResources]) removePrivate(res);
+      releaseLock();
+      const preservedNote = preservedPrivate.length > 0 ? ` Foreign paths preserved: ${preservedPrivate.map((p) => path.relative(root, p)).join(", ")}.` : "";
+      return fail(ctx, `Migration failed before any publication; staging and lock were removed: ${error instanceof Error ? error.message : String(error)}${preservedNote}`);
     }
   } catch (error) {
     return fail(ctx, error instanceof Error ? error.message : String(error));

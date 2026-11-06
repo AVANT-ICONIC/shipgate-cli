@@ -1,5 +1,5 @@
 import { writeFile, mkdir, symlink } from "node:fs/promises";
-import { execFileSync as execFileSyncForTest, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -13,7 +13,14 @@ const MIGRATED_CONFIG = ".shipgate/policies/cleanroom.json";
 const MIGRATED_STATE = ".shipgate/policies/cleanroom";
 const MARKER = ".shipgate/policies/cleanroom/migration.json";
 const LOCK = ".shipgate/policies/.cleanroom-migrate.lock";
-const STAGING = ".shipgate/policies/.cleanroom-migrate.staging";
+const STAGING = ".shipgate/policies/.cleanroom-migrate.staging"; // legacy pre-journal name
+const POLICIES = ".shipgate/policies";
+/** Per-run staging dirs and journals of the journaled protocol. */
+const stagingDirs = (root: string): string[] =>
+  existsSync(path.join(root, POLICIES)) ? readdirSync(path.join(root, POLICIES)).filter((e) => e.startsWith(".cleanroom-migrate.staging")) : [];
+const journalFiles = (root: string): string[] =>
+  existsSync(path.join(root, POLICIES)) ? readdirSync(path.join(root, POLICIES)).filter((e) => e.startsWith(".cleanroom-migrate.journal-")) : [];
+const currentStaging = (root: string): string => path.join(root, POLICIES, stagingDirs(root)[0]!);
 
 /** Legacy repo with adopted policy: init --existing + baseline + a waiver + governance lines. */
 async function legacyRepo(withViolation = true): Promise<string> {
@@ -68,8 +75,9 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
     // The winner's result is complete and undamaged by the loser.
     expect(JSON.parse(readFileSync(path.join(root, MARKER), "utf8")).status).toBe("completed");
     expect(existsSync(path.join(root, LOCK))).toBe(false);
-    expect(existsSync(path.join(root, STAGING))).toBe(false);
     expect(existsSync(path.join(root, MIGRATED_CONFIG))).toBe(true);
+    expect(stagingDirs(root)).toEqual([]);
+    expect(journalFiles(root)).toEqual([]);
     expect(treeBytes(root, ".greenroom")).toEqual(before);
     // Re-run is a verified no-op: the winner's work is intact and consistent.
     expect(migrateCleanroom({ root }).exitCode).toBe(0);
@@ -154,14 +162,28 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
     expect(existsSync(path.join(outside, "policies"))).toBe(false); // no patch through the symlink
   }, 60_000);
 
-  it("a stale lock whose owner pid is dead is recovered; a live one is honored", async () => {
+  it("any existing lock fails closed with a diagnosis; deliberate operator removal resumes", async () => {
     const root = await legacyRepo();
     await mkdir(path.dirname(path.join(root, LOCK)), { recursive: true });
     await writeFile(path.join(root, LOCK), JSON.stringify({ pid: 2147483647, startedAt: "2026-01-01T00:00:00Z" }) + "\n");
-    const recovered = migrateCleanroom({ root });
-    expect(recovered.exitCode).toBe(0);
-    expect(existsSync(path.join(root, LOCK))).toBe(false);
-  }, 120_000);
+    const refused = migrateCleanroom({ root });
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("migration lock is present");
+    expect(refused.stderr).toContain("no longer running");
+    expect(refused.stderr).toContain("remove the lock file deliberately");
+    expect(existsSync(path.join(root, LOCK))).toBe(true); // never reclaimed automatically
+    // The operator confirms nothing is running and removes the lock; the run proceeds.
+    rmSync(path.join(root, LOCK));
+    expect(migrateCleanroom({ root }).exitCode).toBe(0);
+    // A live holder is honored.
+    const root2 = await legacyRepo();
+    await mkdir(path.dirname(path.join(root2, LOCK)), { recursive: true });
+    await writeFile(path.join(root2, LOCK), JSON.stringify({ pid: process.pid, startedAt: "2026-01-01T00:00:00Z" }) + "\n");
+    const locked = migrateCleanroom({ root: root2 });
+    expect(locked.exitCode).toBe(2);
+    expect(locked.stderr).toContain("ALIVE");
+    expect(existsSync(path.join(root2, MIGRATED_CONFIG))).toBe(false);
+  }, 180_000);
 
   it("an external edit to shipgate.config.json during migration is a conflict, never overwritten", async () => {
     const root = await legacyRepo();
@@ -174,11 +196,11 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toContain("external edit");
     expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(userEdit); // untouched
-    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false);
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(true); // published state preserved, journaled
     expect(existsSync(path.join(root, MARKER))).toBe(false);
   }, 120_000);
 
-  it("rollback after our config write never clobbers a later external edit", async () => {
+  it("a failure after the config commit never touches the config, even bytes we wrote", async () => {
     const root = await legacyRepo();
     await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify({ profile: "node-cli" }) + "\n");
     const userEdit = JSON.stringify({ profile: "node-cli", urgent: "user change" }) + "\n";
@@ -186,17 +208,19 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
       root,
       _hooks: {
         afterPlacement: (r) => {
-          // User edits the just-placed config AND placed state gets corrupted:
-          // rollback must remove our placed state but leave the user's edit.
+          // User edits the just-committed config AND placed state is
+          // corrupted: the failure path must preserve everything published,
+          // including the user's edit over our own committed bytes.
           writeFileSync(path.join(r, "shipgate.config.json"), userEdit);
           appendFileSync(path.join(r, ".shipgate", "policies", "cleanroom", "waivers.json"), "corrupted");
         },
       },
     });
     expect(result.exitCode).toBe(2);
-    expect(result.stderr).toContain("left untouched");
+    expect(result.stderr).toContain("interrupted after partial publication");
     expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(userEdit);
-    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false);
+    expect(readFileSync(path.join(root, MIGRATED_STATE, "waivers.json"), "utf8")).toContain("corrupted");
+    expect(journalFiles(root).length).toBe(1);
     expect(existsSync(path.join(root, LOCK))).toBe(false);
   }, 120_000);
 
@@ -229,7 +253,8 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
     expect(readFileSync(path.join(root, MIGRATED_CONFIG), "utf8")).toBe("OTHER WRITER\n"); // preserved
     expect(existsSync(path.join(root, MARKER))).toBe(false);
     expect(existsSync(path.join(root, LOCK))).toBe(false);
-    expect(existsSync(path.join(root, STAGING))).toBe(false);
+    expect(stagingDirs(root)).toEqual([]);
+    expect(journalFiles(root)).toEqual([]);
   }, 120_000);
 
   it("a foreign file inside a freshly appearing destination dir survives rollback", async () => {
@@ -301,7 +326,9 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toContain("external edit");
     expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(userEdit); // edit preserved
-    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false); // placed state rolled back
+    // Published state is preserved and journaled, never rolled back.
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(true);
+    expect(journalFiles(root).length).toBe(1);
     expect(existsSync(path.join(root, ".shipgate", "policies", ".cleanroom-migrate.config-backup"))).toBe(false);
     expect(existsSync(path.join(root, LOCK))).toBe(false);
   }, 120_000);
@@ -316,10 +343,10 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toContain("appeared during the migration");
     expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(foreign); // preserved
-    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false);
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(true); // published state preserved, journaled
   }, 120_000);
 
-  it("a failed merge copy restores the original config from the move-aside backup", async () => {
+  it("a failed merge copy preserves the original at the backup path; resume restores and completes", async () => {
     const root = await legacyRepo();
     const original = JSON.stringify({ profile: "node-cli", keep: "original" }) + "\n";
     await writeFile(path.join(root, "shipgate.config.json"), original);
@@ -328,61 +355,61 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
       _hooks: {
         beforeConfigCommit: (r) => {
           // Force the final copy to fail after the original was moved aside.
-          const staged = path.join(r, ".shipgate", "policies", ".cleanroom-migrate.staging", "shipgate.config.json");
+          const staged = path.join(currentStaging(r), "shipgate.config.json");
           rmSync(staged, { force: true });
           mkdirSync(staged);
         },
       },
     });
     expect(result.exitCode).toBe(2);
-    expect(result.stderr).toContain("rolled back");
-    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(original); // restored
+    expect(result.stderr).toContain("interrupted after partial publication");
+    // The read failed before any move-aside: the original config is untouched,
+    // no backup exists, published state and the journal remain.
+    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(original);
     expect(existsSync(path.join(root, ".shipgate", "policies", ".cleanroom-migrate.config-backup"))).toBe(false);
-    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false);
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(true);
+    expect(journalFiles(root).length).toBe(1);
     expect(existsSync(path.join(root, LOCK))).toBe(false);
-  }, 120_000);
+    // Re-run with healthy staging completes: published pieces are adopted.
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
+    const merged = JSON.parse(readFileSync(path.join(root, "shipgate.config.json"), "utf8")) as Record<string, unknown>;
+    expect(merged.keep).toBe("original");
+    expect((merged.policies as { cleanroom: { enabled: boolean } }).cleanroom.enabled).toBe(true);
+    expect(journalFiles(root)).toEqual([]);
+  }, 240_000);
 
-  it("a crashed migration (staging + partial destination, no marker) resumes byte-verified", async () => {
+  it("a partial destination with no journaled publication is ambiguous, never adopted", async () => {
     const root = await legacyRepo();
-    // Reconstruct the crash state: verified staging mirror present, only the
-    // config file published, no marker (commit point never reached).
-    const staging = path.join(root, STAGING);
-    mkdirSync(path.join(staging, ".shipgate", "policies", "cleanroom"), { recursive: true });
-    writeFileSync(path.join(staging, ".shipgate", "policies", "cleanroom.json"), readFileSync(path.join(root, ".greenroom.json")));
-    rmSync(path.join(staging, ".shipgate", "policies", "cleanroom"), { recursive: true, force: true });
-    mkdirSync(path.join(staging, ".shipgate", "policies"), { recursive: true });
-    execFileSyncForTest("cp", ["-r", path.join(root, ".greenroom"), path.join(staging, ".shipgate", "policies", "cleanroom")]);
-    writeFileSync(path.join(staging, "shipgate.config.json"), JSON.stringify({ policies: { cleanroom: "cleanroom" } }) + "\n");
+    // Bytes alone never prove ownership: a destination that no journal
+    // explains is foreign state, even when its content matches the source.
     mkdirSync(path.join(root, MIGRATED_STATE), { recursive: true });
     writeFileSync(path.join(root, MIGRATED_CONFIG), readFileSync(path.join(root, ".greenroom.json")));
-    rmSync(path.join(root, MIGRATED_STATE), { recursive: true, force: true }); // state not yet published
-
+    rmSync(path.join(root, MIGRATED_STATE), { recursive: true, force: true });
     const result = migrateCleanroom({ root });
-    expect(result.exitCode).toBe(0);
-    const marker = JSON.parse(readFileSync(path.join(root, MARKER), "utf8"));
-    expect(marker.status).toBe("completed");
-    const placed = treeBytes(root, MIGRATED_STATE);
-    delete placed["migration.json"]; // the marker is migration metadata, not state
-    expect(placed).toEqual(treeBytes(root, ".greenroom"));
-    expect(existsSync(path.join(root, STAGING))).toBe(false);
-    expect(existsSync(path.join(root, LOCK))).toBe(false);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("Ambiguous destination");
+    expect(readFileSync(path.join(root, MIGRATED_CONFIG), "utf8")).toBe(readFileSync(path.join(root, ".greenroom.json"), "utf8")); // preserved
   }, 120_000);
 
-  it("a foreign EMPTY directory at the state destination is not silently replaced", async () => {
+  it("an empty destination directory without a journaled reservation is preserved, not replaced", async () => {
     const root = await legacyRepo();
     const result = migrateCleanroom({
       root,
       _hooks: { beforePlacement: (r) => { mkdirSync(path.join(r, MIGRATED_STATE), { recursive: true }); } },
     });
-    // Our own empty-dir crash remnant is published over; a foreign empty dir is
-    // indistinguishable from it, so the contract is: only ever replaced by the
-    // byte-verified staged tree, never by foreign content. The run succeeds and
-    // the result is exactly the verified tree.
-    expect(result.exitCode).toBe(0);
+    // No journal proves the empty dir is our reservation: it may be foreign,
+    // so it is preserved and reported; removal is a deliberate operator act.
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("no journaled reservation");
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(true);
+    rmSync(path.join(root, MIGRATED_STATE), { recursive: true });
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
     const placed = treeBytes(root, MIGRATED_STATE);
     delete placed["migration.json"]; // the marker is migration metadata, not state
     expect(placed).toEqual(treeBytes(root, ".greenroom"));
-  }, 120_000);
+  }, 240_000);
 
   it("foreign content blocking the state rename is never recursively deleted", async () => {
     const root = await legacyRepo();
@@ -406,23 +433,29 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
 
   it("a foreign write at the config refill keeps its path; the original is kept at a unique backup", async () => {
     const root = await legacyRepo();
-    await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify({ profile: "node-cli" }) + "\n");
+    const original = JSON.stringify({ profile: "node-cli" }) + "\n";
+    await writeFile(path.join(root, "shipgate.config.json"), original);
     const foreign = JSON.stringify({ foreign: "newer edit" }) + "\n";
     const result = migrateCleanroom({
       root,
       _hooks: {
-        beforeConfigCommit: (r) => {
-          // Simulate the foreign write landing exactly at the EXCL refill:
-          // replace the staged config with a directory so the copy fails, and
-          // place the foreign file once the original has been moved aside.
-          const staged = path.join(r, ".shipgate", "policies", ".cleanroom-migrate.staging", "shipgate.config.json");
-          rmSync(staged, { force: true });
-          mkdirSync(staged);
+        beforeConfigRefill: (r) => {
+          // The original is aside; a foreign write lands at the path exactly
+          // at the EXCL refill.
+          writeFileSync(path.join(r, "shipgate.config.json"), foreign);
         },
       },
     });
     expect(result.exitCode).toBe(2);
-    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(JSON.stringify({ profile: "node-cli" }) + "\n"); // original restored (copy failed before any foreign landed)
+    expect(result.stderr).toContain("left untouched at shipgate.config.json");
+    // The foreign file keeps its path; the original survives at the unique
+    // backup named in the error; published state is preserved and journaled.
+    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(foreign);
+    const backups = readdirSync(root).filter((e) => e.startsWith("shipgate.config.json.migration-backup-"));
+    expect(backups.length).toBe(1);
+    expect(readFileSync(path.join(root, backups[0]!), "utf8")).toBe(original);
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(true);
+    expect(journalFiles(root).length).toBe(1);
   }, 120_000);
 
   it("losing the lock mid-migration freezes without writes or cleanup", async () => {
@@ -431,7 +464,7 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
       root,
       _hooks: {
         afterStaging: () => {
-          rmSync(path.join(root, LOCK), { force: true }); // stolen/reclaimed lock
+          rmSync(path.join(root, LOCK), { force: true }); // stolen lock
         },
       },
     });
@@ -439,7 +472,15 @@ describe("cleanroom migration adversarial regression (review rounds)", () => {
     expect(result.stderr).toContain("lock lost");
     expect(existsSync(path.join(root, MARKER))).toBe(false);
     expect(existsSync(path.join(root, MIGRATED_CONFIG))).toBe(false); // nothing published after the loss
-  }, 120_000);
+    // Freeze means no cleanup: staging and journal remain for the next run,
+    // which adopts the journal, removes the recorded scratch, and completes.
+    expect(stagingDirs(root).length).toBe(1);
+    expect(journalFiles(root).length).toBe(1);
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
+    expect(stagingDirs(root)).toEqual([]);
+    expect(journalFiles(root)).toEqual([]);
+  }, 240_000);
 
   it("an explicit --legacy-cli path is used; a missing one fails before any write", async () => {
     const root = await legacyRepo();
@@ -488,7 +529,8 @@ describe("cleanroom migration (spec Step 6)", () => {
     expect(marker.parityDigest).toMatch(/^[0-9a-f]{64}$/);
     expect(existsSync(path.join(root, ".greenroom"))).toBe(true);
     expect(existsSync(path.join(root, LOCK))).toBe(false);
-    expect(existsSync(path.join(root, STAGING))).toBe(false);
+    expect(stagingDirs(root)).toEqual([]);
+    expect(journalFiles(root)).toEqual([]);
     // Config created (no ShipGate config existed).
     const config = JSON.parse(readFileSync(path.join(root, "shipgate.config.json"), "utf8")) as { policies: { cleanroom: { enabled: boolean } } };
     expect(config.policies.cleanroom.enabled).toBe(true);
@@ -544,7 +586,7 @@ describe("cleanroom migration (spec Step 6)", () => {
     await writeFile(path.join(root2, LOCK), JSON.stringify({ pid: 1 }));
     const locked = migrateCleanroom({ root: root2 });
     expect(locked.exitCode).toBe(2);
-    expect(locked.stderr).toContain("holds the lock");
+    expect(locked.stderr).toContain("migration lock is present");
     expect(existsSync(path.join(root2, MIGRATED_CONFIG))).toBe(false);
   }, 120_000);
 
@@ -581,7 +623,7 @@ describe("cleanroom migration (spec Step 6)", () => {
     expect(existsSync(path.join(root, MARKER))).toBe(false);
   }, 60_000);
 
-  it("rolls back completely when the staged copy fails re-inventory", async () => {
+  it("fails cleanly (spec 6.10) when the staged copy fails re-inventory", async () => {
     const root = await legacyRepo();
     await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify({ profile: "node-cli" }) + "\n");
     const beforeConfig = readFileSync(path.join(root, "shipgate.config.json"));
@@ -591,42 +633,56 @@ describe("cleanroom migration (spec Step 6)", () => {
       _hooks: { afterStaging: (stagingAbs) => { appendFileSync(path.join(stagingAbs, ".shipgate", "policies", "cleanroom", "skills", "repo-hygiene", "SKILL.md"), "tampered"); } },
     });
     expect(result.exitCode).toBe(2);
-    expect(result.stderr).toContain("rolled back");
+    expect(result.stderr).toContain("before any publication");
     expect(result.stderr).toContain("byte hashes or record counts");
-    // Legacy untouched; no destination, staging, lock, or marker left behind;
-    // pre-existing config restored byte-exact.
+    // Legacy untouched; no destination, staging, journal, lock, or marker left
+    // behind; the pre-existing config is byte-exact (never touched).
     expect(treeBytes(root, ".greenroom")).toEqual(before);
     expect(existsSync(path.join(root, MIGRATED_CONFIG))).toBe(false);
     expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false);
-    expect(existsSync(path.join(root, STAGING))).toBe(false);
+    expect(stagingDirs(root)).toEqual([]);
+    expect(journalFiles(root)).toEqual([]);
     expect(existsSync(path.join(root, LOCK))).toBe(false);
     expect(readFileSync(path.join(root, "shipgate.config.json"))).toEqual(beforeConfig);
   }, 120_000);
 
-  it("rolls back completely when placed state is corrupted before commit", async () => {
+  it("placed state is preserved and journaled when verification fails after publication; resume byte-verifies", async () => {
     const root = await legacyRepo();
     await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify({ profile: "node-cli", keep: true }) + "\n");
-    const beforeConfig = readFileSync(path.join(root, "shipgate.config.json"));
     const before = treeBytes(root, ".greenroom");
     const result = migrateCleanroom({
       root,
       // Corrupt the PLACED migrated state after placement but before the
-      // commit marker: the destination verification must catch it and the
-      // migration must abort atomically.
+      // commit marker: destination verification must catch it, and the
+      // published pieces must be preserved and journaled, never rolled back.
       _hooks: { afterPlacement: (r) => { appendFileSync(path.join(r, ".shipgate", "policies", "cleanroom", "waivers.json"), "corrupted"); } },
     });
     expect(result.exitCode).toBe(2);
-    expect(result.stderr).toContain("rolled back");
-    expect(result.stderr).toContain("waivers.json");
-    // Atomicity: no destination, staging, lock or marker survives; the legacy
-    // source and the pre-existing user config are byte-identical.
+    expect(result.stderr).toContain("interrupted after partial publication");
+    expect(result.stderr).toContain("preserved and journaled");
     expect(treeBytes(root, ".greenroom")).toEqual(before);
-    expect(existsSync(path.join(root, MIGRATED_CONFIG))).toBe(false);
-    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false);
-    expect(existsSync(path.join(root, STAGING))).toBe(false);
+    // Nothing was unpublished: the (corrupted) destination and journal remain;
+    // the already-committed config merge stays; staging and lock are gone.
+    expect(readFileSync(path.join(root, MIGRATED_STATE, "waivers.json"), "utf8")).toContain("corrupted");
+    expect(journalFiles(root).length).toBe(1);
+    expect(stagingDirs(root)).toEqual([]);
     expect(existsSync(path.join(root, LOCK))).toBe(false);
-    expect(readFileSync(path.join(root, "shipgate.config.json"))).toEqual(beforeConfig);
-  }, 120_000);
+    const config = JSON.parse(readFileSync(path.join(root, "shipgate.config.json"), "utf8")) as Record<string, unknown>;
+    expect(config.keep).toBe(true);
+    expect((config.policies as { cleanroom: unknown }).cleanroom).toBeDefined();
+    // A blind re-run refuses: the corrupted bytes do not verify.
+    const blind = migrateCleanroom({ root });
+    expect(blind.exitCode).toBe(2);
+    expect(blind.stderr).toContain("differs from the verified staged copy");
+    // After the operator repairs the destination from the untouched legacy
+    // state, the resume completes byte-verified and cleans up.
+    writeFileSync(path.join(root, MIGRATED_STATE, "waivers.json"), readFileSync(path.join(root, ".greenroom", "waivers.json")));
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
+    expect(journalFiles(root)).toEqual([]);
+    expect(stagingDirs(root)).toEqual([]);
+    expect(JSON.parse(readFileSync(path.join(root, MARKER), "utf8")).status).toBe("completed");
+  }, 240_000);
 
   it("after migration the policy dispatcher reads migrated state and check passes", async () => {
     const root = await legacyRepo(false);
@@ -635,4 +691,102 @@ describe("cleanroom migration (spec Step 6)", () => {
     const check = runCleanroomCli(["check", "--root", root], { cwd: root });
     expect(check.exitCode).toBe(0);
   }, 120_000);
+});
+
+describe("cleanroom migration real-crash recovery (reviewed protocol)", () => {
+  const CRASH_ENV = "SHIPGATE_CLEANROOM_MIGRATE_CRASH_AT";
+  const boundaries = [
+    "afterLock",
+    "afterJournalCreate",
+    "afterStagingCreated",
+    "afterSnapshot",
+    "afterParity",
+    "beforePublishConfig",
+    "afterPublishConfig",
+    "afterStateReservation",
+    "afterPublishState",
+    "beforeConfigCommit",
+    "afterConfigCommit",
+    "beforeMarkerCommit",
+    "afterMarkerCommit",
+  ];
+
+  const runChild = (root: string, env: Record<string, string>) =>
+    new Promise<{ code: number | null; signal: string | null; stdout: string; stderr: string }>((resolvePromise) => {
+      const cliEntry = fileURLToPath(new URL("../../../src/cli.ts", import.meta.url));
+      const child = spawn(process.execPath, ["--import", "tsx", cliEntry, "migrate", "cleanroom", "--root", root], {
+        cwd: path.dirname(cliEntry),
+        env: { ...process.env, ...env },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+      child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+      child.on("close", (code, signal) => resolvePromise({ code, signal, stdout, stderr }));
+    });
+
+  for (const boundary of boundaries) {
+    it(`genuine SIGKILL crash at ${boundary}: fail-closed lock, operator resume completes byte-verified`, async () => {
+      const root = await legacyRepo();
+      const before = treeBytes(root, ".greenroom");
+      const crashed = await runChild(root, { [CRASH_ENV]: boundary });
+      expect(crashed.signal).toBe("SIGKILL"); // genuine process death, not a hook
+      expect(treeBytes(root, ".greenroom")).toEqual(before); // legacy state untouched
+
+      if (boundary === "afterMarkerCommit") {
+        // The commit point landed; the marker-complete re-run verifies the
+        // destination, clears migrator scratch (including the stale lock) and
+        // no-ops.
+        expect(existsSync(path.join(root, MARKER))).toBe(true);
+      } else {
+        expect(existsSync(path.join(root, MARKER))).toBe(false);
+        // A naive re-run fails closed on the stale lock, with a diagnosis.
+        expect(existsSync(path.join(root, LOCK))).toBe(true);
+        const refused = migrateCleanroom({ root });
+        expect(refused.exitCode).toBe(2);
+        expect(refused.stderr).toContain("migration lock is present");
+        expect(refused.stderr).toContain("no longer running");
+        expect(existsSync(path.join(root, MARKER))).toBe(false); // no commit from the refusal
+        // Deliberate operator recovery: remove the lock, then re-run.
+        rmSync(path.join(root, LOCK));
+      }
+
+      const resumed = migrateCleanroom({ root });
+      expect(resumed.exitCode).toBe(0);
+      expect(resumed.stderr).toBe("");
+      // Byte-for-byte result, whatever boundary the crash hit.
+      const placed = treeBytes(root, MIGRATED_STATE);
+      delete placed["migration.json"]; // the marker is migration metadata, not state
+      expect(placed).toEqual(before);
+      expect(readFileSync(path.join(root, MIGRATED_CONFIG))).toEqual(readFileSync(path.join(root, ".greenroom.json")));
+      expect(JSON.parse(readFileSync(path.join(root, MARKER), "utf8")).status).toBe("completed");
+      expect(stagingDirs(root)).toEqual([]);
+      expect(journalFiles(root)).toEqual([]);
+      expect(existsSync(path.join(root, LOCK))).toBe(false);
+    }, 300_000);
+  }
+
+  it("a crash between a journal begin and its done is reconciled by byte-verification", async () => {
+    // afterPublishConfig kills the process after the done record; this test
+    // kills INSIDE the publish window (begin recorded, done not) by crashing
+    // at the reservation boundary, then verifies the empty reservation is
+    // adopted via the journaled identity and publication completes.
+    const root = await legacyRepo();
+    const crashed = await runChild(root, { [CRASH_ENV]: "afterStateReservation" });
+    expect(crashed.signal).toBe("SIGKILL");
+    // The reservation (an empty dir) exists, journaled with its identity.
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(true);
+    expect(readdirSync(path.join(root, MIGRATED_STATE))).toEqual([]);
+    const journal = JSON.parse(
+      readFileSync(path.join(root, POLICIES, journalFiles(root)[0]!), "utf8"),
+    ) as { steps: { op: string; status: string }[] };
+    expect(journal.steps.some((s) => s.op === "state-reservation" && s.status === "done")).toBe(true);
+    expect(journal.steps.some((s) => s.op === "publish-state" && s.status === "done")).toBe(false);
+    rmSync(path.join(root, LOCK));
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
+    const placed = treeBytes(root, MIGRATED_STATE);
+    delete placed["migration.json"];
+    expect(placed).toEqual(treeBytes(root, ".greenroom"));
+  }, 300_000);
 });
