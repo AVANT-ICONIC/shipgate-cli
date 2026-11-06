@@ -84,4 +84,4 @@ removing the partial destination.
   limitation: a code config cannot be inspected safely, so the command stops
   with the proposal again on every run, even after you merge - it does not
   currently detect the added policy in a TypeScript/JavaScript config.
-- A config that already contains `policies.cleanroom` is left as is.
+- A JSON config that already contains `policies.cleanroom` is left as is (a TypeScript/JavaScript config is not inspected, so the same detection does not apply there).
