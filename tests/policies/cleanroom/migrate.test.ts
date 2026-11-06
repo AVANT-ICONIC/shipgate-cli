@@ -485,12 +485,15 @@ describe("cleanroom migration (spec Step 6)", () => {
     expect(result.stderr).toContain("Ambiguous destination");
   }, 60_000);
 
-  it("recovers interrupted staging but refuses an active lock", async () => {
+  it("fixed-name staging residue is preserved and reported, never deleted by name; an active lock refuses", async () => {
     const root = await legacyRepo();
     await mkdir(path.join(root, STAGING, "junk"), { recursive: true });
+    await writeFile(path.join(root, STAGING, "junk", "foreign.txt"), "not proven migrator scratch\n");
     const recovered = migrateCleanroom({ root });
     expect(recovered.exitCode).toBe(0);
-    expect(existsSync(path.join(root, STAGING))).toBe(false);
+    // The name predates journaled provenance: preserved and reported.
+    expect(recovered.stdout).toContain("preserved foreign paths");
+    expect(readFileSync(path.join(root, STAGING, "junk", "foreign.txt"), "utf8")).toBe("not proven migrator scratch\n");
 
     const root2 = await legacyRepo();
     await mkdir(path.dirname(path.join(root2, LOCK)), { recursive: true });

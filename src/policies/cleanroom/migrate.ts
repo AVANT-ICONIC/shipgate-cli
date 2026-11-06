@@ -668,13 +668,15 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         throw new Error(`Ambiguous destination: migrated state exists (${MIGRATED_CONFIG_FILE} / ${MIGRATED_STATE_DIR}/) without a migration marker or a journal recording its publication. Refusing to combine two state roots.`);
       }
 
-      // Clean migrator scratch: the pre-journal fixed-name staging dir is
-      // migrator-private by definition; per-run staging dirs are removed only
-      // when the adopted journal records them with a matching identity.
+      // Clean migrator scratch: per-run staging dirs are removed only when
+      // the adopted journal records them with a matching identity. The
+      // pre-journal fixed-name staging dir is NOT deleted by name: a name is
+      // not ownership, so it is preserved and reported like any unproven
+      // residue.
       for (const entry of fs.readdirSync(policiesDirAbs)) {
         const abs = path.join(policiesDirAbs, entry);
         if (entry === path.basename(LEGACY_STAGING_DIR)) {
-          fs.rmSync(abs, { recursive: true, force: true });
+          preservedPrivate.push(abs); // unproven provenance: preserved, reported
           continue;
         }
         if (!entry.startsWith(STAGING_PREFIX)) continue;
