@@ -39,13 +39,16 @@ import {
  *
  * Reviewed publication protocol (fail-closed, journaled, monotonic):
  * - Legacy state is never deleted. An existing JSON shipgate.config.json is
- *   merged in place per spec 6.6 (policies.cleanroom added, unrelated values
- *   preserved): the exact pre-merge bytes are preserved at a backup path, the
- *   live config is re-verified byte-for-byte immediately before the atomic
- *   rename, and the merge runs before any other publication so a foreign edit
- *   still stops the run with nothing published (spec 6.10). A TypeScript/JavaScript
- *   config cannot be edited safely by heuristics: it gets a proposed patch
- *   and exit 2 instead.
+ *   merged per spec 6.6 (policies.cleanroom added, unrelated values and the
+ *   file mode preserved) under one rule without exception: no rename ever
+ *   targets an occupied or predictable path, and no user byte is ever
+ *   deleted. The live config is captured by an atomic move-aside to a unique
+ *   per-run path in the same syscall that clears the path; the merged file
+ *   is installed with a no-replace hardlink; the outcome is re-read and
+ *   verified; and any interference at any boundary is restored with
+ *   link-only operations and reported, with every actual displaced entry
+ *   preserved. A TypeScript/JavaScript config cannot be edited safely by
+ *   heuristics: it gets a proposed patch and exit 2 instead.
  * - Every public path is created by an exclusive operation (O_EXCL copy,
  *   mkdir, hardlink); nothing foreign is ever overwritten or deleted, and
  *   content equality is never treated as ownership.
@@ -67,7 +70,6 @@ import {
 const LOCK_FILE = ".shipgate/policies/.cleanroom-migrate.lock";
 const LEGACY_STAGING_DIR = ".shipgate/policies/.cleanroom-migrate.staging"; // pre-journal naming; migrator scratch only
 const STAGING_PREFIX = ".cleanroom-migrate.staging-";
-const CONFIG_BACKUP_FILE = ".shipgate/policies/.cleanroom-migrate.config-backup";
 const CONFIG_PATCH_FILE = ".shipgate/policies/cleanroom.config-patch.json";
 const POLICIES_DIR = ".shipgate/policies";
 const POLICY_CONFIG_KEY = { enabled: true, configFile: ".shipgate/policies/cleanroom.json" } as const;
@@ -286,7 +288,7 @@ function copyStateInto(root: string, stagingAbs: string, sourceInventory: Invent
 
 type ShipGateConfigAction =
   | { kind: "none-present-create-json" }
-  | { kind: "json-merge"; file: string; original: Buffer }
+  | { kind: "json-merge"; file: string; original: Buffer; mode: number }
   | { kind: "already-present" }
   | { kind: "ts-patch-required"; file: string };
 
@@ -302,7 +304,8 @@ function planShipGateConfig(root: string): ShipGateConfigAction {
     }
     const policies = data.policies as Record<string, unknown> | undefined;
     if (policies && "cleanroom" in policies) return { kind: "already-present" };
-    return { kind: "json-merge", file: jsonFile, original };
+    const mode = fs.statSync(jsonFile).mode & 0o777;
+    return { kind: "json-merge", file: jsonFile, original, mode };
   }
   for (const name of ["shipgate.config.ts", "shipgate.config.mts", "shipgate.config.js", "shipgate.config.mjs", "shipgate.config.cjs"]) {
     const file = path.join(root, name);
@@ -471,12 +474,12 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
     // Config must parse as a legacy Cleanroom config object.
     readJsonFile(legacyConfigAbs, LEGACY_CONFIG_FILE);
 
-    const configAction = planShipGateConfig(root);
+    let configAction = planShipGateConfig(root);
     const planSummary = () => {
       line(`Cleanroom migration plan for ${root}`);
       line(`  source: ${LEGACY_CONFIG_FILE} + ${LEGACY_STATE_DIR}/ (${sourceInventory.files.length} files, ${sourceInventory.files.reduce((n, f) => n + f.bytes, 0)} bytes)`);
       line(`  destination: ${MIGRATED_CONFIG_FILE} + ${MIGRATED_STATE_DIR}/ (byte-for-byte copy; legacy state is kept)`);
-      line(`  config: ${configAction.kind === "json-merge" ? "merge policies.cleanroom into the existing shipgate.config.json (unrelated values preserved; original bytes kept at .cleanroom-migrate.config-backup)" : configAction.kind === "already-present" ? "policies.cleanroom already configured" : "create shipgate.config.json with policies.cleanroom"}`);
+      line(`  config: ${configAction.kind === "json-merge" ? "merge policies.cleanroom into the existing shipgate.config.json (unrelated values preserved; original bytes kept at a unique .cleanroom-migrate.config-backup-<run> path)" : configAction.kind === "already-present" ? "policies.cleanroom already configured" : "create shipgate.config.json with policies.cleanroom"}`);
     };
 
     // Containment: never write through a symlinked ancestor, for every path
@@ -485,11 +488,10 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
     const placedConfig = path.join(root, MIGRATED_CONFIG_FILE);
     const placedState = path.join(root, MIGRATED_STATE_DIR);
     const shipgateConfigAbs = path.join(root, "shipgate.config.json");
-    const configBackupAbs = path.join(root, CONFIG_BACKUP_FILE);
     const runId = crypto.randomUUID();
     const configMergeTempAbs = path.join(root, `shipgate.config.json.migrate-tmp-${runId}`);
     const stagingAbs = path.join(policiesDirAbs, `${STAGING_PREFIX}${runId}`);
-    for (const abs of [lockAbs, stagingAbs, placedConfig, placedState, shipgateConfigAbs, markerAbs, configBackupAbs, configMergeTempAbs, path.join(root, CONFIG_PATCH_FILE)]) {
+    for (const abs of [lockAbs, stagingAbs, placedConfig, placedState, shipgateConfigAbs, markerAbs, configMergeTempAbs, path.join(root, CONFIG_PATCH_FILE)]) {
       assertContainedAncestors(root, path.relative(root, abs));
     }
 
@@ -712,25 +714,6 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         }
       }
 
-      // Config backup residue: a backup recorded by the adopted journal with
-      // a matching identity and content is this recovery's own backup and is
-      // reconciled by the merge phase below. Anything else is foreign or from
-      // an attempt whose journal is gone: preserved, never auto-restored.
-      if (fs.existsSync(configBackupAbs)) {
-        const recordedBackup = lastStepFor(journal, "config-backup");
-        const backupDetail = recordedBackup?.detail as { dev?: number; ino?: number; sha256?: string } | undefined;
-        const backupStat = fs.lstatSync(configBackupAbs);
-        const ownBackup =
-          recordedBackup?.status === "done" &&
-          backupDetail !== undefined &&
-          backupStat.dev === backupDetail.dev &&
-          backupStat.ino === backupDetail.ino &&
-          sha256(fs.readFileSync(configBackupAbs)) === backupDetail.sha256;
-        if (!ownBackup) {
-          throw new Error(`A config backup from an earlier migration attempt exists at ${CONFIG_BACKUP_FILE}. It was preserved; inspect it, restore or remove it deliberately, then re-run.`);
-        }
-      }
-
       // A proposed patch is a write too: it happens under containment and
       // the lock, never before them. A TypeScript/JavaScript config cannot
       // be edited safely by heuristics (spec 6.6), so the run stops here
@@ -845,42 +828,75 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       assertLockHeld();
 
       // 8.5 Existing JSON config (spec 6.6): merge policies.cleanroom into
-      // shipgate.config.json, preserving unrelated values. This is the only
-      // step that displaces pre-existing user bytes, so it runs BEFORE any
-      // other publication: if the live config no longer matches the bytes the
-      // merge was computed from, the run stops here and the spec 6.10 cleanup
-      // removes every private resource, leaving the foreign config untouched.
-      // The exact pre-merge bytes are preserved at CONFIG_BACKUP_FILE, and the
-      // replacement itself is a single atomic rename over the verified path.
-      type MergeDetail = { kind: "json-merge"; before: string; after: string; temp?: { path: string; dev: number; ino: number } };
+      // shipgate.config.json, preserving unrelated values and the file mode.
+      // This is the only step that displaces pre-existing user bytes, so it
+      // runs BEFORE any other publication and follows one rule without
+      // exception: no rename ever targets an occupied or predictable path,
+      // and no user byte is ever deleted. The live config is captured by an
+      // atomic move-aside to a unique per-run path in the SAME syscall that
+      // clears the path; the merged file is installed with a no-replace
+      // hardlink (EEXIST preserves any foreign create); every post-condition
+      // is re-read and verified; and any interference restores the captured
+      // bytes with link-only, never-overwrite operations, preserving every
+      // actual displaced entry. A foreign write at ANY boundary survives on
+      // disk and is reported; the run then halts with exit 2.
+      type MergeDetail = { kind: "json-merge"; before: string; after: string; capture: string; temp: { path: string; dev: number; ino: number } };
       const configCommitStep = lastStepFor(journal, "config-commit");
       const configCommitDetail = configCommitStep?.detail as Partial<MergeDetail> | undefined;
-      let mergeNeeded = false;
-      if (configCommitStep && configCommitDetail?.kind === "json-merge" && typeof configCommitDetail.before === "string" && typeof configCommitDetail.after === "string") {
-        // A previous run began (and maybe completed) the merge. The live
-        // config must be exactly one of the two journaled states; anything
-        // else is a foreign edit, preserved, never overwritten.
-        let liveSha: string;
+      const readIfPresent = (abs: string): Buffer | null => {
         try {
-          liveSha = sha256(fs.readFileSync(shipgateConfigAbs));
+          return fs.readFileSync(abs);
         } catch {
-          throw new Error("shipgate.config.json was removed after the migration's config commit began. Nothing was overwritten; restore the config deliberately, then re-run.");
+          return null;
         }
-        if (liveSha === configCommitDetail.after) {
+      };
+      let mergeDone = false;
+      if (configCommitStep && configCommitDetail?.kind === "json-merge" && typeof configCommitDetail.before === "string" && typeof configCommitDetail.after === "string" && typeof configCommitDetail.capture === "string") {
+        // A previous run began (and maybe completed) the merge. Reconcile
+        // purely from which paths exist and what they contain.
+        const captureAbs = path.join(policiesDirAbs, configCommitDetail.capture);
+        const live = readIfPresent(shipgateConfigAbs);
+        const captured = readIfPresent(captureAbs);
+        const beforeSha = configCommitDetail.before;
+        const afterSha = configCommitDetail.after;
+        // The crashed run's merge temp (journaled with its identity) is
+        // removed wherever the reconcile lands; anything not matching the
+        // journaled identity is preserved.
+        const journaledTemp = configCommitDetail.temp;
+        if (typeof journaledTemp?.path === "string" && typeof journaledTemp.dev === "number" && typeof journaledTemp.ino === "number") {
+          try {
+            const tempAbs = path.join(root, journaledTemp.path);
+            const tempStat = fs.lstatSync(tempAbs);
+            if (tempStat.dev === journaledTemp.dev && tempStat.ino === journaledTemp.ino) fs.rmSync(tempAbs, { force: true });
+          } catch {
+            // already gone
+          }
+        }
+        if (live !== null && sha256(live) === afterSha && captured !== null && sha256(captured) === beforeSha) {
+          // Crash between the verified install and its done record: adopt.
           if (configCommitStep.status !== "done") {
-            // Crash between the atomic rename and its done record: the merged
-            // bytes are in place; adopt them.
             journaled(journal, { op: "config-commit", status: "done", detail: configCommitDetail });
           }
-        } else if (liveSha === configCommitDetail.before && configCommitStep.status !== "done") {
-          mergeNeeded = true; // the rename never landed; re-attempt below
+          mergeDone = true;
+        } else if (live === null && captured !== null) {
+          // Crash between the move-aside and the install: the path is empty,
+          // so restoring the captured bytes displaces nothing.
+          fs.renameSync(captureAbs, shipgateConfigAbs);
+          fsyncDir(root);
+          // The config is back: recompute the plan (it was computed while
+          // the config was absent) and fall through to a fresh merge attempt.
+          configAction = planShipGateConfig(root);
+          // Staging was built under the no-config plan and may hold a
+          // create-only config; drop it so the later EXCL create is skipped.
+          const stagedShipgateConfig = path.join(stagingAbs, "shipgate.config.json");
+          if (fs.existsSync(stagedShipgateConfig)) fs.rmSync(stagedShipgateConfig); // our own staged bytes
+        } else if (live !== null && sha256(live) === beforeSha && captured === null) {
+          // The move-aside never landed; re-attempt below.
         } else {
-          throw new Error("shipgate.config.json changed after the migration's config commit began (foreign edit). It is preserved, never overwritten. Reconcile deliberately, then re-run.");
+          throw new Error(`shipgate.config.json is in an unexpected state after the migration's config commit began (foreign edit or interference). Nothing was overwritten: the live config and the capture ${configCommitDetail.capture} are preserved. Reconcile deliberately, then re-run.`);
         }
-      } else if (configAction.kind === "json-merge") {
-        mergeNeeded = true;
       }
-      if (mergeNeeded && configAction.kind === "json-merge") {
+      if (!mergeDone && configAction.kind === "json-merge") {
         // A merge temp journaled by a crashed attempt is identity-verified
         // and removed before its replacement is created; anything else at
         // that path is preserved.
@@ -901,60 +917,112 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         const mergedBytes = Buffer.from(JSON.stringify({ ...mergedData, policies: mergedPolicies }, null, 2) + "\n", "utf8");
         const afterSha = sha256(mergedBytes);
         const liveUnchanged = (): boolean => {
-          try {
-            return fs.readFileSync(shipgateConfigAbs).equals(beforeBytes);
-          } catch {
-            return false;
-          }
+          const live = readIfPresent(shipgateConfigAbs);
+          return live !== null && live.equals(beforeBytes);
         };
         const foreignEdit = () =>
           new Error("shipgate.config.json changed during the migration (external write). Refusing to merge over foreign bytes; nothing was published and the live config is untouched. Re-run to migrate against the current config.");
         if (!liveUnchanged()) throw foreignEdit();
-        // Preserve the exact pre-merge bytes before any displacement. A
-        // journaled backup from a crashed attempt (identity- and
-        // content-verified by the residue check above) is reused as is.
-        if (lastStepFor(journal, "config-backup")?.status !== "done") {
-          try {
-            fs.writeFileSync(configBackupAbs, beforeBytes, { flag: "wx" });
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`A config backup appeared at ${CONFIG_BACKUP_FILE} during the migration. It was preserved; inspect it, then re-run.`);
-            throw error;
-          }
-          fsyncFile(configBackupAbs);
-          fsyncDir(policiesDirAbs);
-          trackPrivate(configBackupAbs, false);
-          const backupStat = fs.lstatSync(configBackupAbs);
-          journaled(journal, { op: "config-backup", status: "done", detail: { dev: backupStat.dev, ino: backupStat.ino, sha256: beforeSha } });
-          crashPoint("afterConfigBackup");
-        }
-        // Materialize the merged bytes in a same-directory temp (rename needs
-        // the same filesystem as the config), then re-verify the live config
-        // one final time immediately before the atomic rename. A cooperative
-        // foreign write before this check stops the run with nothing
-        // displaced; the residual rename race after the check is documented
-        // in docs/CLEANROOM-MIGRATION.md and the backup preserves the
-        // pre-merge bytes regardless.
-        fs.writeFileSync(configMergeTempAbs, mergedBytes, { flag: "wx" }); // uuid name cannot collide
+        const captureName = `.cleanroom-migrate.config-backup-${runId}`;
+        const captureAbs = path.join(policiesDirAbs, captureName);
+        const heldName = `.cleanroom-migrate.config-held-${runId}`;
+        const heldAbs = path.join(policiesDirAbs, heldName);
+        // Materialize the merged bytes in a same-directory temp with the
+        // ORIGINAL file mode (a 0600 config stays 0600), fsynced.
+        fs.writeFileSync(configMergeTempAbs, mergedBytes, { flag: "wx", mode: configAction.mode }); // uuid name cannot collide
         trackPrivate(configMergeTempAbs, false);
         fsyncFile(configMergeTempAbs);
         options._hooks?.beforeConfigCommit?.(root);
+        // Fail closed on ANY residue at the capture prefix: a foreign file
+        // there means interference or an earlier attempt whose journal is
+        // gone. Names only ever stop the run; they never prove ownership.
+        const captureResidue = fs.readdirSync(policiesDirAbs).filter((e) => e.startsWith(".cleanroom-migrate.config-backup") || e.startsWith(".cleanroom-migrate.config-held"));
+        if (captureResidue.length > 0) {
+          throw new Error(`A config backup from an earlier migration attempt exists at ${POLICIES_DIR}/${captureResidue[0]}. It was preserved; inspect it, restore or remove it deliberately, then re-run.`);
+        }
         if (!liveUnchanged()) throw foreignEdit();
-        const detail: MergeDetail = { kind: "json-merge", before: beforeSha, after: afterSha };
         const mergeTempStat = fs.lstatSync(configMergeTempAbs);
-        detail.temp = { path: path.basename(configMergeTempAbs), dev: mergeTempStat.dev, ino: mergeTempStat.ino };
+        const detail: MergeDetail = {
+          kind: "json-merge",
+          before: beforeSha,
+          after: afterSha,
+          capture: captureName,
+          temp: { path: path.basename(configMergeTempAbs), dev: mergeTempStat.dev, ino: mergeTempStat.ino },
+        };
         journaled(journal, { op: "config-commit", status: "begin", detail });
-        // From the rename on, the backup is the only record of the displaced
-        // bytes: it must survive every later outcome, including handled
-        // failures, so it leaves the private-cleanup set here.
-        const backupRes = privateResources.find((r) => r.abs === configBackupAbs);
-        if (backupRes) privateResources.splice(privateResources.indexOf(backupRes), 1);
         crashPoint("beforeConfigCommit");
-        fs.renameSync(configMergeTempAbs, shipgateConfigAbs);
+        // Move-aside: capture the live config's CURRENT bytes - whatever they
+        // are at this instant - at a unique per-run path, in the same atomic
+        // rename that clears the path. The target cannot pre-exist, so no
+        // foreign file can be overwritten here.
+        fs.renameSync(shipgateConfigAbs, captureAbs);
         fsyncDir(root);
-        journaled(journal, { op: "config-commit", status: "done", detail });
-        crashPoint("afterConfigCommit");
-        const mergeTempRes = privateResources.find((r) => r.abs === configMergeTempAbs);
-        if (mergeTempRes) removePrivate(mergeTempRes); // already renamed away: no-op
+        fsyncDir(policiesDirAbs);
+        crashPoint("afterConfigMoveAside");
+        // Install the merged bytes with a no-replace hardlink: a foreign
+        // create in the gap fails EEXIST and is preserved, never displaced.
+        let installed = true;
+        try {
+          fs.linkSync(configMergeTempAbs, shipgateConfigAbs);
+          fsyncFile(shipgateConfigAbs);
+          fsyncDir(root);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          installed = false;
+        }
+        crashPoint("afterConfigMergeLink");
+        // Verify the actual outcome, not the plan: the captured bytes must be
+        // exactly what the merge was computed from, and the live path must
+        // hold exactly the merged bytes (or a foreign occupant).
+        const capturedNow = readIfPresent(captureAbs);
+        const liveNow = readIfPresent(shipgateConfigAbs);
+        const clean = installed && liveNow !== null && liveNow.equals(mergedBytes) && capturedNow !== null && capturedNow.equals(beforeBytes);
+        if (clean) {
+          // The capture keeps the original inode and its mode; it stays as
+          // the permanent pre-merge record and is never cleaned up.
+          journaled(journal, { op: "config-commit", status: "done", detail });
+          crashPoint("afterConfigCommit");
+          const mergeTempRes = privateResources.find((r) => r.abs === configMergeTempAbs);
+          if (mergeTempRes) removePrivate(mergeTempRes); // extra link to the merged inode: identity-verified removal
+        } else {
+          // Interference at some boundary. Restore without ever displacing:
+          // hold the current live content aside at a unique path (rename to
+          // an absent target), put the captured bytes back with a no-replace
+          // link, and preserve anything that is not byte-identical to our
+          // own merged output. Then halt.
+          const held: string[] = [];
+          if (liveNow !== null) {
+            fs.renameSync(shipgateConfigAbs, heldAbs); // unique target: displaces nothing
+            held.push(heldName);
+          }
+          let restored = false;
+          if (capturedNow !== null) {
+            try {
+              fs.linkSync(captureAbs, shipgateConfigAbs); // no-replace: a foreign create is preserved
+              restored = true;
+              fsyncDir(root);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            }
+          }
+          // If the capture is not the planned pre-merge bytes, a foreign
+          // write replaced the config before the capture: keep our in-memory
+          // copy of the planned bytes as a recovery record too.
+          let premergeNote = "";
+          if (capturedNow !== null && !capturedNow.equals(beforeBytes)) {
+            const premergeName = `.cleanroom-migrate.config-premerge-${runId}`;
+            fs.writeFileSync(path.join(policiesDirAbs, premergeName), beforeBytes, { flag: "wx" });
+            fsyncDir(policiesDirAbs);
+            premergeNote = ` The pre-merge bytes read before the interference are at ${POLICIES_DIR}/${premergeName}.`;
+          }
+          const preserveNote = held.length > 0 ? ` The pre-existing config content is preserved at ${POLICIES_DIR}/${held[0]}.` : "";
+          const captureNote = capturedNow !== null ? ` The captured content is at ${POLICIES_DIR}/${captureName}.` : "";
+          throw new Error(
+            `shipgate.config.json changed at the merge boundary (external write). The migration did not overwrite it:` +
+              `${restored ? " the config content captured at the merge boundary was restored to shipgate.config.json." : " the live config was left exactly as found."}` +
+              `${preserveNote}${captureNote}${premergeNote} Nothing was deleted. Reconcile deliberately, then re-run.`,
+          );
+        }
       }
 
       // 9. Publish. Genuine boundary: POSIX has no multi-file atomic commit,
