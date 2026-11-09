@@ -80,12 +80,17 @@ removing the partial destination.
   commits it. Run the migration with editors, formatters, watchers, and
   other ShipGate invocations stopped: the lock serializes migrators only and
   cannot fence a writer that ignores it, and the pre-commit re-verification
-  is detection, not compare-and-swap. If the config changes between the read
-  and the commit, the migration fails closed with exit 2, leaves your
-  config untouched, and retains the backup and journal for recovery. JSON
+  is detection, not compare-and-swap. Every change the migration detects -
+  to the live config, the backup, or the private temp, during the run or
+  between runs - fails closed with exit 2: your config is left untouched,
+  foreign bytes are preserved and reported, and the backup and journal are
+  retained for recovery. The single atomic rename of the verified merged
+  temp onto `shipgate.config.json` is the explicit, authorized
+  config-replace exception; nothing else foreign is ever overwritten. JSON
   re-serialization preserves values and key order, not comments or
   whitespace. A symlinked, malformed, or non-object JSON config (including a
-  non-object `policies` value) is refused with exit 2 and no proposal.
+  non-object `policies` or `policies.cleanroom` value) is refused with
+  exit 2 and no proposal.
 - TypeScript/JavaScript config: a proposed patch is written (same path
   rules); merge `policies.cleanroom` into your config and re-run. Known
   limitation: a code config cannot be inspected safely, so the command stops

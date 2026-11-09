@@ -306,7 +306,13 @@ function planShipGateConfig(root: string): ShipGateConfigAction {
     if (policies !== undefined && (typeof policies !== "object" || policies === null || Array.isArray(policies))) {
       throw new Error(`shipgate.config.json has a non-object "policies" value; refusing to coerce it. Fix the config deliberately and re-run.`);
     }
-    if (policies && "cleanroom" in policies) return { kind: "already-present" };
+    if (policies && "cleanroom" in policies) {
+      const cleanroom = (policies as Record<string, unknown>).cleanroom;
+      if (typeof cleanroom !== "object" || cleanroom === null || Array.isArray(cleanroom)) {
+        throw new Error(`shipgate.config.json has a malformed policies.cleanroom value (expected an object, found ${Array.isArray(cleanroom) ? "an array" : cleanroom === null ? "null" : typeof cleanroom}). Refusing to migrate; fix the config deliberately and re-run.`);
+      }
+      return { kind: "already-present" };
+    }
     return { kind: "json-merge", file: jsonFile };
   }
   for (const name of ["shipgate.config.ts", "shipgate.config.mts", "shipgate.config.js", "shipgate.config.mjs", "shipgate.config.cjs"]) {
@@ -751,6 +757,28 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         }
       }
 
+      // A config that reads as already-configured must still match the
+      // journaled merge/create when the adopted journal recorded one: an
+      // unrelated edit between runs keeps policies.cleanroom present but
+      // changes the bytes, which is a conflict, not a clean resume.
+      if (configAction.kind === "already-present") {
+        const commitRec = lastStepFor(journal, "config-commit");
+        const expected =
+          commitRec?.status === "done"
+            ? commitRec.sha256
+            : ((commitRec?.detail as { mergedSha256?: string } | undefined)?.mergedSha256 ??
+              (commitRec ? sha256(Buffer.from(JSON.stringify({ policies: { cleanroom: POLICY_CONFIG_KEY } }, null, 2) + "\n")) : undefined));
+        if (commitRec && expected !== undefined) {
+          const current = fs.existsSync(shipgateConfigAbs) ? sha256(fs.readFileSync(shipgateConfigAbs)) : null;
+          if (current !== expected) {
+            throw new Error(`shipgate.config.json changed after the interrupted migration's config step; it no longer matches the journaled bytes. The config is preserved; reconcile deliberately, then re-run.`);
+          }
+          if (commitRec.status !== "done") {
+            journaled(journal, { op: "config-commit", status: "done", path: "shipgate.config.json", sha256: expected });
+          }
+        }
+      }
+
       // A proposed patch is a write too: it happens under containment and
       // the lock, never before them. Only TypeScript/JavaScript configs stop
       // here (they cannot be edited safely by heuristics, spec 6.6); JSON
@@ -989,7 +1017,7 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
             throw new Error(`Failed to write shipgate.config.json; any partial file was left in place deliberately. Reconcile and re-run. (${error instanceof Error ? error.message : String(error)})`);
           }
         }
-        journaled(journal, { op: "config-commit", status: "done", path: "shipgate.config.json" });
+        journaled(journal, { op: "config-commit", status: "done", path: "shipgate.config.json", sha256: sha256(fs.readFileSync(shipgateConfigAbs)) });
         crashPoint("afterConfigCommit");
       } else if (configAction.kind === "json-merge") {
         // Spec 6.6 automatic merge of an existing JSON config (Option D).
@@ -1045,7 +1073,12 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
           const policies = (policiesValue ?? {}) as Record<string, unknown>;
           if (commitStep?.status !== "begin" && "cleanroom" in policies) {
             // policies.cleanroom appeared since planning: the reviewed
-            // already-configured semantics apply; never overwrite it.
+            // already-configured semantics apply; never overwrite it. Its
+            // shape must still be a valid policy config object.
+            const cleanroom = policies.cleanroom;
+            if (typeof cleanroom !== "object" || cleanroom === null || Array.isArray(cleanroom)) {
+              throw new Error(`shipgate.config.json has a malformed policies.cleanroom value (expected an object). Refusing to migrate; fix the config deliberately and re-run.`);
+            }
             journaled(journal, { op: "config", status: "done", detail: { kind: "already-present" } });
             mergeCommitted = true;
           }
@@ -1064,12 +1097,21 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
             // path), O_EXCL no-replace, restrictive 0600, journaled with
             // dev/ino + sha256, retained after commit and after failure.
             const backupStep = lastStepFor(journal, "config-backup");
-            if (backupStep?.status === "done") {
+            if (backupStep?.status === "done" && fs.existsSync(configBackupAbs)) {
               const recorded = (backupStep.detail ?? {}) as { dev?: number; ino?: number; sha256?: string };
               const st = fs.lstatSync(configBackupAbs);
               if (st.dev !== recorded.dev || st.ino !== recorded.ino || sha256(fs.readFileSync(configBackupAbs)) !== recorded.sha256) {
                 throw new Error(`The config backup at ${CONFIG_BACKUP_FILE} no longer matches its journaled identity; it was preserved, not removed. Reconcile deliberately, then re-run.`);
               }
+            } else if (backupStep?.status === "done") {
+              // The backup was deleted between runs: recreate it from the
+              // still-original config and journal the new identity.
+              journaled(journal, { op: "config-backup", status: "begin", path: CONFIG_BACKUP_FILE });
+              fs.writeFileSync(configBackupAbs, origBytes, { flag: "wx", mode: 0o600 });
+              fsyncFile(configBackupAbs);
+              fsyncDir(policiesDirAbs);
+              const st = fs.lstatSync(configBackupAbs);
+              journaled(journal, { op: "config-backup", status: "done", path: CONFIG_BACKUP_FILE, detail: { dev: st.dev, ino: st.ino, sha256: origSha256 } });
             } else {
               if (fs.existsSync(configBackupAbs)) {
                 // Begin recorded (or nothing) but no done: ownership unproven.
@@ -1126,14 +1168,22 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
             journaled(journal, { op: "config-merge-temp", status: "done", path: configTempRel, detail: { dev: tempStat.dev, ino: tempStat.ino, sha256: mergedSha256 } });
             trackPrivate(configTempAbs, false, mergedSha256);
             crashPoint("afterConfigMergeTemp");
-            // Verify the backup's bytes and identity before committing.
+            options._hooks?.beforeConfigCommit?.(root);
+            crashPoint("beforeConfigCommit");
+            // Re-verify the backup AND the temp AFTER the last declared
+            // interference phase: both must still match their journaled
+            // dev/ino + sha256, or the commit would install or rely on
+            // foreign bytes.
             const backupVerify = (lastStepFor(journal, "config-backup")!.detail ?? {}) as { dev?: number; ino?: number; sha256?: string };
             const backupStat = fs.lstatSync(configBackupAbs);
             if (backupStat.dev !== backupVerify.dev || backupStat.ino !== backupVerify.ino || sha256(fs.readFileSync(configBackupAbs)) !== backupVerify.sha256) {
               throw new Error(`The config backup at ${CONFIG_BACKUP_FILE} changed before the commit; refusing to replace the config. The original config is untouched; the foreign backup is preserved. Reconcile deliberately, then re-run.`);
             }
-            options._hooks?.beforeConfigCommit?.(root);
-            crashPoint("beforeConfigCommit");
+            const tempVerify = (lastStepFor(journal, "config-merge-temp")!.detail ?? {}) as { dev?: number; ino?: number; sha256?: string };
+            const tempNow = fs.lstatSync(configTempAbs);
+            if (tempNow.dev !== tempVerify.dev || tempNow.ino !== tempVerify.ino || sha256(fs.readFileSync(configTempAbs)) !== tempVerify.sha256) {
+              throw new Error(`The config merge temp at ${configTempRel} changed after it was journaled; refusing to install it. The original config is untouched; the foreign temp is preserved. Reconcile deliberately, then re-run.`);
+            }
             // Detection recheck (not CAS): the live config must still be the
             // exact file the merge was computed from.
             const recheckStat = fs.lstatSync(shipgateConfigAbs);
