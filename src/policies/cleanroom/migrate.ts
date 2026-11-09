@@ -39,9 +39,13 @@ import {
  *
  * Reviewed publication protocol (fail-closed, journaled, monotonic):
  * - Legacy state is never deleted. An existing JSON shipgate.config.json is
- *   never merged automatically (no in-place merge of a pre-existing file can
- *   be made safe against foreign-byte loss): it gets a proposed merged config
- *   and exit 2, like the TypeScript/JavaScript case.
+ *   merged in place per spec 6.6 (policies.cleanroom added, unrelated values
+ *   preserved): the exact pre-merge bytes are preserved at a backup path, the
+ *   live config is re-verified byte-for-byte immediately before the atomic
+ *   rename, and the merge runs before any other publication so a foreign edit
+ *   still stops the run with nothing published (spec 6.10). A TypeScript/JavaScript
+ *   config cannot be edited safely by heuristics: it gets a proposed patch
+ *   and exit 2 instead.
  * - Every public path is created by an exclusive operation (O_EXCL copy,
  *   mkdir, hardlink); nothing foreign is ever overwritten or deleted, and
  *   content equality is never treated as ownership.
@@ -282,17 +286,23 @@ function copyStateInto(root: string, stagingAbs: string, sourceInventory: Invent
 
 type ShipGateConfigAction =
   | { kind: "none-present-create-json" }
-  | { kind: "json-merge"; file: string }
+  | { kind: "json-merge"; file: string; original: Buffer }
   | { kind: "already-present" }
   | { kind: "ts-patch-required"; file: string };
 
 function planShipGateConfig(root: string): ShipGateConfigAction {
   const jsonFile = path.join(root, "shipgate.config.json");
   if (fs.existsSync(jsonFile)) {
-    const data = readJsonFile(jsonFile, "shipgate.config.json") as Record<string, unknown>;
+    const original = fs.readFileSync(jsonFile);
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(original.toString("utf8")) as Record<string, unknown>;
+    } catch (error) {
+      throw new Error(`Malformed JSON in shipgate.config.json: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const policies = data.policies as Record<string, unknown> | undefined;
     if (policies && "cleanroom" in policies) return { kind: "already-present" };
-    return { kind: "json-merge", file: jsonFile };
+    return { kind: "json-merge", file: jsonFile, original };
   }
   for (const name of ["shipgate.config.ts", "shipgate.config.mts", "shipgate.config.js", "shipgate.config.mjs", "shipgate.config.cjs"]) {
     const file = path.join(root, name);
@@ -466,7 +476,7 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       line(`Cleanroom migration plan for ${root}`);
       line(`  source: ${LEGACY_CONFIG_FILE} + ${LEGACY_STATE_DIR}/ (${sourceInventory.files.length} files, ${sourceInventory.files.reduce((n, f) => n + f.bytes, 0)} bytes)`);
       line(`  destination: ${MIGRATED_CONFIG_FILE} + ${MIGRATED_STATE_DIR}/ (byte-for-byte copy; legacy state is kept)`);
-      line(`  config: ${configAction.kind === "json-merge" ? "write a proposed merged shipgate.config.json (automatic in-place merge disabled)" : configAction.kind === "already-present" ? "policies.cleanroom already configured" : "create shipgate.config.json with policies.cleanroom"}`);
+      line(`  config: ${configAction.kind === "json-merge" ? "merge policies.cleanroom into the existing shipgate.config.json (unrelated values preserved; original bytes kept at .cleanroom-migrate.config-backup)" : configAction.kind === "already-present" ? "policies.cleanroom already configured" : "create shipgate.config.json with policies.cleanroom"}`);
     };
 
     // Containment: never write through a symlinked ancestor, for every path
@@ -477,8 +487,9 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
     const shipgateConfigAbs = path.join(root, "shipgate.config.json");
     const configBackupAbs = path.join(root, CONFIG_BACKUP_FILE);
     const runId = crypto.randomUUID();
+    const configMergeTempAbs = path.join(root, `shipgate.config.json.migrate-tmp-${runId}`);
     const stagingAbs = path.join(policiesDirAbs, `${STAGING_PREFIX}${runId}`);
-    for (const abs of [lockAbs, stagingAbs, placedConfig, placedState, shipgateConfigAbs, markerAbs, configBackupAbs, path.join(root, CONFIG_PATCH_FILE)]) {
+    for (const abs of [lockAbs, stagingAbs, placedConfig, placedState, shipgateConfigAbs, markerAbs, configBackupAbs, configMergeTempAbs, path.join(root, CONFIG_PATCH_FILE)]) {
       assertContainedAncestors(root, path.relative(root, abs));
     }
 
@@ -701,27 +712,32 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         }
       }
 
-      // Config backup residue from an earlier merge-protocol attempt is
-      // preserved, never auto-restored: its ownership cannot be re-proven.
+      // Config backup residue: a backup recorded by the adopted journal with
+      // a matching identity and content is this recovery's own backup and is
+      // reconciled by the merge phase below. Anything else is foreign or from
+      // an attempt whose journal is gone: preserved, never auto-restored.
       if (fs.existsSync(configBackupAbs)) {
-        throw new Error(`A config backup from an earlier migration attempt exists at ${CONFIG_BACKUP_FILE}. It was preserved; inspect it, restore or remove it deliberately, then re-run.`);
+        const recordedBackup = lastStepFor(journal, "config-backup");
+        const backupDetail = recordedBackup?.detail as { dev?: number; ino?: number; sha256?: string } | undefined;
+        const backupStat = fs.lstatSync(configBackupAbs);
+        const ownBackup =
+          recordedBackup?.status === "done" &&
+          backupDetail !== undefined &&
+          backupStat.dev === backupDetail.dev &&
+          backupStat.ino === backupDetail.ino &&
+          sha256(fs.readFileSync(configBackupAbs)) === backupDetail.sha256;
+        if (!ownBackup) {
+          throw new Error(`A config backup from an earlier migration attempt exists at ${CONFIG_BACKUP_FILE}. It was preserved; inspect it, restore or remove it deliberately, then re-run.`);
+        }
       }
 
       // A proposed patch is a write too: it happens under containment and
-      // the lock, never before them. Two cases stop here with exit 2:
-      // TypeScript/JavaScript configs (cannot be edited safely by
-      // heuristics) and existing JSON configs (no in-place merge of a
-      // pre-existing file can be made safe against foreign-byte loss, so the
-      // automatic merge of spec 6.6 is disabled pending the owner decision).
-      if (configAction.kind === "ts-patch-required" || configAction.kind === "json-merge") {
-        const patchContent =
-          configAction.kind === "json-merge"
-            ? (() => {
-                const data = readJsonFile(configAction.file, "shipgate.config.json") as Record<string, unknown>;
-                const policies = { ...((data.policies as object) ?? {}), cleanroom: POLICY_CONFIG_KEY };
-                return JSON.stringify({ ...data, policies }, null, 2) + "\n";
-              })()
-            : JSON.stringify({ policies: { cleanroom: POLICY_CONFIG_KEY } }, null, 2) + "\n";
+      // the lock, never before them. A TypeScript/JavaScript config cannot
+      // be edited safely by heuristics (spec 6.6), so the run stops here
+      // with exit 2 and a proposed patch. Existing JSON configs continue
+      // below: spec 6.6 merges them automatically.
+      if (configAction.kind === "ts-patch-required") {
+        const patchContent = JSON.stringify({ policies: { cleanroom: POLICY_CONFIG_KEY } }, null, 2) + "\n";
         let patchPath = path.join(root, CONFIG_PATCH_FILE);
         try {
           fs.writeFileSync(patchPath, patchContent, { flag: "wx" });
@@ -738,13 +754,8 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         // No publication happened: remove the journal and release the lock.
         for (const res of [...privateResources]) removePrivate(res);
         releaseLock();
-        if (configAction.kind === "ts-patch-required") {
-          line(`ShipGate config is TypeScript/JavaScript (${path.basename(configAction.file)}) and cannot be edited safely by heuristics.`);
-          line(`A proposed patch was written to ${path.relative(root, patchPath)}. Merge policies.cleanroom into the config, then re-run this command.`);
-        } else {
-          line(`ShipGate config already exists as JSON (shipgate.config.json). Automatic in-place merge is disabled: replacing a pre-existing file can destroy foreign bytes.`);
-          line(`A proposed merged config was written to ${path.relative(root, patchPath)}. Review it, replace shipgate.config.json with it, then re-run this command.`);
-        }
+        line(`ShipGate config is TypeScript/JavaScript (${path.basename(configAction.file)}) and cannot be edited safely by heuristics.`);
+        line(`A proposed patch was written to ${path.relative(root, patchPath)}. Merge policies.cleanroom into the config, then re-run this command.`);
         return done(2);
       }
 
@@ -832,6 +843,119 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       }
 
       assertLockHeld();
+
+      // 8.5 Existing JSON config (spec 6.6): merge policies.cleanroom into
+      // shipgate.config.json, preserving unrelated values. This is the only
+      // step that displaces pre-existing user bytes, so it runs BEFORE any
+      // other publication: if the live config no longer matches the bytes the
+      // merge was computed from, the run stops here and the spec 6.10 cleanup
+      // removes every private resource, leaving the foreign config untouched.
+      // The exact pre-merge bytes are preserved at CONFIG_BACKUP_FILE, and the
+      // replacement itself is a single atomic rename over the verified path.
+      type MergeDetail = { kind: "json-merge"; before: string; after: string; temp?: { path: string; dev: number; ino: number } };
+      const configCommitStep = lastStepFor(journal, "config-commit");
+      const configCommitDetail = configCommitStep?.detail as Partial<MergeDetail> | undefined;
+      let mergeNeeded = false;
+      if (configCommitStep && configCommitDetail?.kind === "json-merge" && typeof configCommitDetail.before === "string" && typeof configCommitDetail.after === "string") {
+        // A previous run began (and maybe completed) the merge. The live
+        // config must be exactly one of the two journaled states; anything
+        // else is a foreign edit, preserved, never overwritten.
+        let liveSha: string;
+        try {
+          liveSha = sha256(fs.readFileSync(shipgateConfigAbs));
+        } catch {
+          throw new Error("shipgate.config.json was removed after the migration's config commit began. Nothing was overwritten; restore the config deliberately, then re-run.");
+        }
+        if (liveSha === configCommitDetail.after) {
+          if (configCommitStep.status !== "done") {
+            // Crash between the atomic rename and its done record: the merged
+            // bytes are in place; adopt them.
+            journaled(journal, { op: "config-commit", status: "done", detail: configCommitDetail });
+          }
+        } else if (liveSha === configCommitDetail.before && configCommitStep.status !== "done") {
+          mergeNeeded = true; // the rename never landed; re-attempt below
+        } else {
+          throw new Error("shipgate.config.json changed after the migration's config commit began (foreign edit). It is preserved, never overwritten. Reconcile deliberately, then re-run.");
+        }
+      } else if (configAction.kind === "json-merge") {
+        mergeNeeded = true;
+      }
+      if (mergeNeeded && configAction.kind === "json-merge") {
+        // A merge temp journaled by a crashed attempt is identity-verified
+        // and removed before its replacement is created; anything else at
+        // that path is preserved.
+        const recordedTemp = configCommitDetail?.temp;
+        if (typeof recordedTemp?.path === "string" && typeof recordedTemp.dev === "number" && typeof recordedTemp.ino === "number") {
+          try {
+            const tempAbs = path.join(root, recordedTemp.path);
+            const tempStat = fs.lstatSync(tempAbs);
+            if (tempStat.dev === recordedTemp.dev && tempStat.ino === recordedTemp.ino) fs.rmSync(tempAbs, { force: true });
+          } catch {
+            // already gone
+          }
+        }
+        const beforeBytes: Buffer = configAction.original;
+        const beforeSha = sha256(beforeBytes);
+        const mergedData = JSON.parse(beforeBytes.toString("utf8")) as Record<string, unknown>;
+        const mergedPolicies = { ...((mergedData.policies as object) ?? {}), cleanroom: POLICY_CONFIG_KEY };
+        const mergedBytes = Buffer.from(JSON.stringify({ ...mergedData, policies: mergedPolicies }, null, 2) + "\n", "utf8");
+        const afterSha = sha256(mergedBytes);
+        const liveUnchanged = (): boolean => {
+          try {
+            return fs.readFileSync(shipgateConfigAbs).equals(beforeBytes);
+          } catch {
+            return false;
+          }
+        };
+        const foreignEdit = () =>
+          new Error("shipgate.config.json changed during the migration (external write). Refusing to merge over foreign bytes; nothing was published and the live config is untouched. Re-run to migrate against the current config.");
+        if (!liveUnchanged()) throw foreignEdit();
+        // Preserve the exact pre-merge bytes before any displacement. A
+        // journaled backup from a crashed attempt (identity- and
+        // content-verified by the residue check above) is reused as is.
+        if (lastStepFor(journal, "config-backup")?.status !== "done") {
+          try {
+            fs.writeFileSync(configBackupAbs, beforeBytes, { flag: "wx" });
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`A config backup appeared at ${CONFIG_BACKUP_FILE} during the migration. It was preserved; inspect it, then re-run.`);
+            throw error;
+          }
+          fsyncFile(configBackupAbs);
+          fsyncDir(policiesDirAbs);
+          trackPrivate(configBackupAbs, false);
+          const backupStat = fs.lstatSync(configBackupAbs);
+          journaled(journal, { op: "config-backup", status: "done", detail: { dev: backupStat.dev, ino: backupStat.ino, sha256: beforeSha } });
+          crashPoint("afterConfigBackup");
+        }
+        // Materialize the merged bytes in a same-directory temp (rename needs
+        // the same filesystem as the config), then re-verify the live config
+        // one final time immediately before the atomic rename. A cooperative
+        // foreign write before this check stops the run with nothing
+        // displaced; the residual rename race after the check is documented
+        // in docs/CLEANROOM-MIGRATION.md and the backup preserves the
+        // pre-merge bytes regardless.
+        fs.writeFileSync(configMergeTempAbs, mergedBytes, { flag: "wx" }); // uuid name cannot collide
+        trackPrivate(configMergeTempAbs, false);
+        fsyncFile(configMergeTempAbs);
+        options._hooks?.beforeConfigCommit?.(root);
+        if (!liveUnchanged()) throw foreignEdit();
+        const detail: MergeDetail = { kind: "json-merge", before: beforeSha, after: afterSha };
+        const mergeTempStat = fs.lstatSync(configMergeTempAbs);
+        detail.temp = { path: path.basename(configMergeTempAbs), dev: mergeTempStat.dev, ino: mergeTempStat.ino };
+        journaled(journal, { op: "config-commit", status: "begin", detail });
+        // From the rename on, the backup is the only record of the displaced
+        // bytes: it must survive every later outcome, including handled
+        // failures, so it leaves the private-cleanup set here.
+        const backupRes = privateResources.find((r) => r.abs === configBackupAbs);
+        if (backupRes) privateResources.splice(privateResources.indexOf(backupRes), 1);
+        crashPoint("beforeConfigCommit");
+        fs.renameSync(configMergeTempAbs, shipgateConfigAbs);
+        fsyncDir(root);
+        journaled(journal, { op: "config-commit", status: "done", detail });
+        crashPoint("afterConfigCommit");
+        const mergeTempRes = privateResources.find((r) => r.abs === configMergeTempAbs);
+        if (mergeTempRes) removePrivate(mergeTempRes); // already renamed away: no-op
+      }
 
       // 9. Publish. Genuine boundary: POSIX has no multi-file atomic commit,
       // so publication is a monotonic sequence of single-syscall exclusive
@@ -946,9 +1070,9 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
           // A previous crashed run already committed these exact bytes.
         } else {
           // Create-only: EXCL create. Any existing different content - foreign
-          // or user-authored - is a conflict, never an overwrite. (Existing
-          // JSON configs never reach this point: they stop at the proposed
-          // patch above. The rejected move-aside merge machinery is gone.)
+          // or user-authored - is a conflict, never an overwrite. (Only the
+          // none-present-create-json case stages a config: an existing JSON
+          // config is merged earlier, before publication, per spec 6.6.)
           try {
             fs.copyFileSync(stagedConfig, shipgateConfigAbs, fs.constants.COPYFILE_EXCL);
             fsyncFile(shipgateConfigAbs);
@@ -974,8 +1098,10 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
 
       // 11. Commit point: write the finalized marker via temp + hardlink
       // (atomic, no-replace), fsynced, then release private resources.
+      const committedConfigKind = (lastStepFor(journal, "config-commit")?.detail as { kind?: string } | undefined)?.kind;
       const marker = {
         version: 1,
+        shipgateConfig: committedConfigKind === "json-merge" ? "merged" : configAction.kind === "none-present-create-json" ? "created" : "already-present",
         managedFiles,
         sourceCommit: spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim() || null,
         tools: { shipgate: packageJson.version, cleanroomPolicy: comparator.version, comparator },

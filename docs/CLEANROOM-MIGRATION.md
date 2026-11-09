@@ -5,9 +5,7 @@ and `.greenroom/`) into the ShipGate layout (`.shipgate/policies/cleanroom.json`
 and `.shipgate/policies/cleanroom/`). Legacy state is never deleted.
 
 This page documents the failure and recovery behavior operators should
-expect. It describes current behavior on the migration branch; the handling
-of a pre-existing JSON `shipgate.config.json` (proposed merged file plus
-exit 2, no automatic merge) is a pending spec decision and may change.
+expect. It describes current behavior on the migration branch.
 
 ## What is guaranteed
 
@@ -16,7 +14,9 @@ exit 2, no automatic merge) is a pending spec decision and may change.
 - Old and new `check --json` must produce identical findings and exit codes
   before anything is published.
 - Publication uses exclusive-create operations only (O_EXCL copies, mkdir,
-  hardlinks). No public path is overwritten. On handled failures, published
+  hardlinks), with one exception: an existing JSON `shipgate.config.json`
+  is merged in place (see "Config handling"). No other public path is
+  overwritten. On handled failures, published
   state and your data are preserved; cleanup removes only journal-proven,
   inode-verified private scratch (this run's staging, temps, journal, and an
   empty reservation directory whose identity matches its journal record).
@@ -73,12 +73,22 @@ removing the partial destination.
 ## Config handling
 
 - No `shipgate.config.*` exists: one is created with `policies.cleanroom`.
-- `shipgate.config.json` exists (pending spec decision): the migration
-  writes a proposed merged config to `.shipgate/policies/cleanroom.config-patch.json`
-  and exits with code 2. If that path is already taken by different content,
-  a uniquely suffixed path is written instead - use the exact path the
-  command reports. Review the proposal, replace `shipgate.config.json` with
-  it, and re-run.
+- `shipgate.config.json` exists: the migration merges `policies.cleanroom`
+  into it automatically (spec 6.6), preserving unrelated values. The merge
+  runs before any other publication: the exact pre-merge bytes are written
+  to `.shipgate/policies/.cleanroom-migrate.config-backup`, the live config
+  is re-read and required to be byte-identical to what the merge was
+  computed from, and the replacement is a single atomic rename. If the
+  config changed under the migration (an external write), the run stops with
+  exit 2 before publishing anything; your edit wins and is never overwritten
+  - re-run to migrate against the current config. A foreign edit that lands
+  in the small window between that final check and the rename can still be
+  replaced by the merge; the backup preserves the pre-merge bytes in every
+  case, and a config changed after the merge is detected as a conflict on
+  the next run, preserved and reported. The backup file is kept after a
+  successful migration as the record of the pre-migration config; remove it
+  deliberately when no longer needed. A leftover backup from an interrupted
+  attempt blocks a fresh run until inspected and removed deliberately.
 - TypeScript/JavaScript config: a proposed patch is written (same path
   rules); merge `policies.cleanroom` into your config and re-run. Known
   limitation: a code config cannot be inspected safely, so the command stops

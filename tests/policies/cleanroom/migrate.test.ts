@@ -513,31 +513,71 @@ describe("cleanroom migration (spec Step 6)", () => {
     expect(existsSync(path.join(root, ".shipgate"))).toBe(false);
   }, 60_000);
 
-  it("an existing JSON config gets a proposed merged file, never an automatic in-place merge", async () => {
+  it("an existing JSON config is merged automatically (spec 6.6), unrelated values preserved, original bytes backed up", async () => {
     const root = await legacyRepo();
     const original = JSON.stringify({ profile: "node-cli", custom: { keep: [1, 2] } }, null, 2) + "\n";
     await writeFile(path.join(root, "shipgate.config.json"), original);
     const result = migrateCleanroom({ root });
+    expect(result.exitCode).toBe(0);
+    // The live config is the merge: policies.cleanroom added, unrelated
+    // values preserved.
+    const merged = JSON.parse(readFileSync(path.join(root, "shipgate.config.json"), "utf8")) as Record<string, unknown>;
+    expect(merged.profile).toBe("node-cli");
+    expect(merged.custom).toEqual({ keep: [1, 2] });
+    expect((merged.policies as { cleanroom: unknown }).cleanroom).toEqual({ enabled: true, configFile: ".shipgate/policies/cleanroom.json" });
+    // The exact pre-merge bytes survive at the backup path.
+    expect(readFileSync(path.join(root, ".shipgate/policies/.cleanroom-migrate.config-backup"), "utf8")).toBe(original);
+    expect(JSON.parse(readFileSync(path.join(root, MARKER), "utf8")).shipgateConfig).toBe("merged");
+    expect(existsSync(path.join(root, LOCK))).toBe(false);
+    expect(journalFiles(root)).toEqual([]);
+    // Re-run of the completed migration is a no-op.
+    const again = migrateCleanroom({ root });
+    expect(again.exitCode).toBe(0);
+    expect(again.stdout).toContain("No-op");
+  }, 240_000);
+
+  it("a foreign config edit in the merge window is a conflict: foreign bytes win, nothing is published, re-run merges the current config", async () => {
+    const root = await legacyRepo();
+    const original = JSON.stringify({ profile: "node-cli" }, null, 2) + "\n";
+    await writeFile(path.join(root, "shipgate.config.json"), original);
+    const foreign = JSON.stringify({ profile: "node-cli", urgent: "foreign edit" }) + "\n";
+    const result = migrateCleanroom({
+      root,
+      _hooks: { beforeConfigCommit: (r) => { writeFileSync(path.join(r, "shipgate.config.json"), foreign); } },
+    });
     expect(result.exitCode).toBe(2);
-    expect(result.stdout).toContain("Automatic in-place merge is disabled");
-    expect(result.stdout).toContain("proposed merged config");
-    // The original is byte-untouched; the patch carries the full merge,
-    // preserving unrelated values.
-    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(original);
-    const patch = JSON.parse(readFileSync(path.join(root, ".shipgate/policies/cleanroom.config-patch.json"), "utf8")) as Record<string, unknown>;
-    expect(patch.profile).toBe("node-cli");
-    expect(patch.custom).toEqual({ keep: [1, 2] });
-    expect((patch.policies as { cleanroom: { enabled: boolean } }).cleanroom.enabled).toBe(true);
-    // No migration happened yet.
+    expect(result.stderr).toContain("changed during the migration");
+    // Foreign bytes are preserved; nothing was published; every private
+    // resource (staging, journal, backup, temp, lock) is gone (spec 6.10).
+    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(foreign);
     expect(existsSync(path.join(root, MIGRATED_CONFIG))).toBe(false);
+    expect(existsSync(path.join(root, MIGRATED_STATE))).toBe(false);
     expect(existsSync(path.join(root, MARKER))).toBe(false);
     expect(journalFiles(root)).toEqual([]);
     expect(existsSync(path.join(root, LOCK))).toBe(false);
-    // The user applies the proposed merge deliberately; the re-run completes.
-    await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify(patch, null, 2) + "\n");
+    expect(existsSync(path.join(root, ".shipgate/policies/.cleanroom-migrate.config-backup"))).toBe(false);
+    // A re-run merges the CURRENT (foreign-edited) config.
     const resumed = migrateCleanroom({ root });
     expect(resumed.exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(path.join(root, MARKER), "utf8")).status).toBe("completed");
+    const merged = JSON.parse(readFileSync(path.join(root, "shipgate.config.json"), "utf8")) as Record<string, unknown>;
+    expect(merged.urgent).toBe("foreign edit");
+    expect((merged.policies as { cleanroom: { enabled: boolean } }).cleanroom.enabled).toBe(true);
+    expect(readFileSync(path.join(root, ".shipgate/policies/.cleanroom-migrate.config-backup"), "utf8")).toBe(foreign);
+  }, 240_000);
+
+  it("a config backup from an earlier attempt is preserved and blocks a fresh run until deliberately removed", async () => {
+    const root = await legacyRepo();
+    await writeFile(path.join(root, "shipgate.config.json"), JSON.stringify({ profile: "node-cli" }) + "\n");
+    mkdirSync(path.join(root, POLICIES), { recursive: true });
+    await writeFile(path.join(root, ".shipgate/policies/.cleanroom-migrate.config-backup"), "earlier attempt bytes\n");
+    const result = migrateCleanroom({ root });
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("config backup from an earlier migration attempt");
+    expect(readFileSync(path.join(root, ".shipgate/policies/.cleanroom-migrate.config-backup"), "utf8")).toBe("earlier attempt bytes\n");
+    expect(existsSync(path.join(root, MARKER))).toBe(false);
+    // Deliberate removal unblocks the merge.
+    rmSync(path.join(root, ".shipgate/policies/.cleanroom-migrate.config-backup"));
+    expect(migrateCleanroom({ root }).exitCode).toBe(0);
   }, 240_000);
 
   it("writes a proposed patch and returns 2 for a TypeScript ShipGate config", async () => {
@@ -791,5 +831,84 @@ describe("cleanroom migration real-crash recovery (reviewed protocol)", () => {
     const placed = treeBytes(root, MIGRATED_STATE);
     delete placed["migration.json"];
     expect(placed).toEqual(treeBytes(root, ".greenroom"));
+  }, 300_000);
+});
+
+describe("cleanroom migration real-crash recovery (JSON config merge, spec 6.6)", () => {
+  const CRASH_ENV = "SHIPGATE_CLEANROOM_MIGRATE_CRASH_AT";
+  const BACKUP = ".shipgate/policies/.cleanroom-migrate.config-backup";
+
+  const runChild = (root: string, env: Record<string, string>) =>
+    new Promise<{ code: number | null; signal: string | null; stdout: string; stderr: string }>((resolvePromise) => {
+      const cliEntry = fileURLToPath(new URL("../../../src/cli.ts", import.meta.url));
+      const child = spawn(process.execPath, ["--import", "tsx", cliEntry, "migrate", "cleanroom", "--root", root], {
+        cwd: path.dirname(cliEntry),
+        env: { ...process.env, ...env },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+      child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+      child.on("close", (code, signal) => resolvePromise({ code, signal, stdout, stderr }));
+    });
+
+  for (const boundary of ["afterConfigBackup", "beforeConfigCommit", "afterConfigCommit"]) {
+    it(`genuine SIGKILL crash at ${boundary} with an existing JSON config: resume completes the merge byte-verified`, async () => {
+      const root = await legacyRepo();
+      const original = JSON.stringify({ profile: "node-cli", custom: { keep: [1, 2] } }, null, 2) + "\n";
+      writeFileSync(path.join(root, "shipgate.config.json"), original);
+      const mergedText = JSON.stringify({ profile: "node-cli", custom: { keep: [1, 2] }, policies: { cleanroom: { enabled: true, configFile: ".shipgate/policies/cleanroom.json" } } }, null, 2) + "\n";
+      const crashed = await runChild(root, { [CRASH_ENV]: boundary });
+      expect(crashed.signal).toBe("SIGKILL"); // genuine process death, not a hook
+      // The live config is either the original (rename not landed) or the
+      // complete merge (rename landed); never anything partial.
+      expect([original, mergedText]).toContain(readFileSync(path.join(root, "shipgate.config.json"), "utf8"));
+      // The pre-merge bytes were backed up before any displacement.
+      expect(readFileSync(path.join(root, BACKUP), "utf8")).toBe(original);
+      expect(existsSync(path.join(root, MARKER))).toBe(false);
+      // A naive re-run fails closed on the stale lock.
+      expect(existsSync(path.join(root, LOCK))).toBe(true);
+      const refused = migrateCleanroom({ root });
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr).toContain("migration lock is present");
+      expect(existsSync(path.join(root, MARKER))).toBe(false);
+      // Deliberate operator recovery: remove the lock, then re-run.
+      rmSync(path.join(root, LOCK));
+      const resumed = migrateCleanroom({ root });
+      expect(resumed.exitCode).toBe(0);
+      expect(resumed.stderr).toBe("");
+      // The merge landed exactly once: unrelated values preserved, cleanroom added.
+      expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(mergedText);
+      expect(readFileSync(path.join(root, BACKUP), "utf8")).toBe(original);
+      expect(JSON.parse(readFileSync(path.join(root, MARKER), "utf8")).shipgateConfig).toBe("merged");
+      // Byte-for-byte state result, whatever boundary the crash hit.
+      const placed = treeBytes(root, MIGRATED_STATE);
+      delete placed["migration.json"];
+      expect(placed).toEqual(treeBytes(root, ".greenroom"));
+      expect(readFileSync(path.join(root, MIGRATED_CONFIG))).toEqual(readFileSync(path.join(root, ".greenroom.json")));
+      expect(stagingDirs(root)).toEqual([]);
+      expect(journalFiles(root)).toEqual([]);
+      expect(existsSync(path.join(root, LOCK))).toBe(false);
+      // No merge temp residue at the repository root.
+      expect(readdirSync(root).filter((e) => e.startsWith("shipgate.config.json.migrate-tmp-"))).toEqual([]);
+    }, 300_000);
+  }
+
+  it("a foreign edit after the config commit began is a preserved conflict, never an overwrite", async () => {
+    const root = await legacyRepo();
+    const original = JSON.stringify({ profile: "node-cli" }) + "\n";
+    writeFileSync(path.join(root, "shipgate.config.json"), original);
+    // Crash after the merge commit point so the merged config is live.
+    const crashed = await runChild(root, { [CRASH_ENV]: "afterConfigCommit" });
+    expect(crashed.signal).toBe("SIGKILL");
+    // A foreign editor rewrites the merged config while the lock is stale.
+    const foreign = JSON.stringify({ profile: "node-cli", policies: { cleanroom: { enabled: false } }, mine: true }) + "\n";
+    writeFileSync(path.join(root, "shipgate.config.json"), foreign);
+    rmSync(path.join(root, LOCK)); // deliberate operator act
+    const refused = migrateCleanroom({ root });
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("foreign edit");
+    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(foreign); // preserved
+    expect(existsSync(path.join(root, MARKER))).toBe(false); // no commit from the refusal
   }, 300_000);
 });
