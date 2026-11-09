@@ -23,6 +23,7 @@ import {
   journalFileName,
   lastStepFor,
   listJournals,
+  stepsFor,
   readJournal,
   recordStep,
   type Journal,
@@ -47,10 +48,16 @@ import {
  *   atomic rename commits it. The pre-commit re-verification is detection,
  *   not compare-and-swap; no guarantee is claimed against a writer that
  *   violates the precondition. TypeScript/JavaScript configs still get a
- *   proposed patch and exit 2.
- * - Every public path is created by an exclusive operation (O_EXCL copy,
- *   mkdir, hardlink); nothing foreign is ever overwritten or deleted, and
- *   content equality is never treated as ownership.
+ *   proposed patch and exit 2. A config with comments is not valid JSON: it
+ *   is refused as malformed, never accepted with comments stripped.
+ * - State and marker public paths are created by exclusive operations only
+ *   (O_EXCL copy, mkdir, hardlink); nothing foreign is ever overwritten or
+ *   deleted, and content equality is never treated as ownership. The ONE
+ *   bounded exception is the JSON config merge above: a single journaled
+ *   atomic rename replaces shipgate.config.json with the verified merged
+ *   bytes - the explicit, authorized config-replace exception. Every change
+ *   the migration detects (live config, backup, or temp, during the run or
+ *   between runs) fails closed instead: exit 2, foreign bytes preserved.
  * - Every public mutation is recorded in a durable per-run journal (fsync of
  *   file and parent directory) before it is attempted and after it lands.
  * - A handled failure BEFORE any publication removes only private per-run
@@ -757,6 +764,53 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
         }
       }
 
+      // Recovery precedence: a journaled config MERGE binds the resume no
+      // matter how the current config plans (a deleted config plans as
+      // "create", an edited one as "already-present"). Once the merge is
+      // committed - done recorded, or the rename landed without its done -
+      // the config must be the journaled merged bytes and the retained
+      // backup must still exist; anything else is a conflict, never a
+      // silent recreate or a finalize without the retained backup.
+      const mergeBegin = stepsFor(journal, "config-commit").find(
+        (s) => s.status === "begin" && typeof (s.detail as { mergedSha256?: unknown } | undefined)?.mergedSha256 === "string",
+      );
+      if (mergeBegin) {
+        const mergedSha256 = (mergeBegin.detail as { mergedSha256: string }).mergedSha256;
+        const current = fs.existsSync(shipgateConfigAbs) ? sha256(fs.readFileSync(shipgateConfigAbs)) : null;
+        const commitDone = lastStepFor(journal, "config-commit")?.status === "done";
+        // The rename consumes the temp: a journaled temp whose file is gone
+        // proves the merge committed even without its done record. A config
+        // reverted to the original bytes after that is a conflict, not a
+        // pre-commit resume; silently re-merging would hide a foreign
+        // between-run change.
+        const tempStep = lastStepFor(journal, "config-merge-temp");
+        // A journaled abort proves the rename never happened (handled
+        // pre-rename failures record one); without it, a consumed temp plus
+        // the original bytes back in place is an ambiguous post-commit
+        // state and must conflict, not silently re-merge.
+        const aborted = lastStepFor(journal, "config-merge-abort") !== null;
+        const origSha256 = (mergeBegin.detail as { origSha256?: string }).origSha256;
+        const tempConsumed = tempStep?.status === "done" && !fs.existsSync(path.join(root, tempStep.path ?? ""));
+        const committed = !aborted && (commitDone || current === mergedSha256 || (tempConsumed && current === origSha256));
+        if (current === null) {
+          // A merge began and the config is gone: planning would call this
+          // "no config present" and create a default-only one, losing the
+          // original keys. Never recreate silently.
+          throw new Error(`shipgate.config.json is missing after the interrupted migration began its merge; it no longer matches the journaled bytes. Restore the merged config deliberately (the original is in the backup at ${CONFIG_BACKUP_FILE}), or remove the destination, journal, and marker residue deliberately and re-run from the untouched legacy state.`);
+        }
+        if (committed) {
+          if (current !== mergedSha256) {
+            throw new Error(`shipgate.config.json changed after the interrupted migration committed its merge; it no longer matches the journaled bytes. The file is preserved; restore the merged config deliberately (the original is in the backup at ${CONFIG_BACKUP_FILE}), or remove the destination, journal, and marker residue deliberately and re-run from the untouched legacy state.`);
+          }
+          if (!commitDone) {
+            journaled(journal, { op: "config-commit", status: "done", path: "shipgate.config.json", sha256: mergedSha256 });
+          }
+          if (lastStepFor(journal, "config-backup") !== null && !fs.existsSync(configBackupAbs)) {
+            throw new Error(`The config backup recorded in the migration journal (${CONFIG_BACKUP_FILE}) is missing after the config merge was committed. The merged config contains no recoverable copy of the original bytes. Restore a byte-identical backup deliberately, or remove the destination, journal, and marker residue deliberately and re-run from the untouched legacy state.`);
+          }
+        }
+      }
+
       // A config that reads as already-configured must still match the
       // journaled merge/create when the adopted journal recorded one: an
       // unrelated edit between runs keeps policies.cleanroom present but
@@ -1177,11 +1231,13 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
             const backupVerify = (lastStepFor(journal, "config-backup")!.detail ?? {}) as { dev?: number; ino?: number; sha256?: string };
             const backupStat = fs.lstatSync(configBackupAbs);
             if (backupStat.dev !== backupVerify.dev || backupStat.ino !== backupVerify.ino || sha256(fs.readFileSync(configBackupAbs)) !== backupVerify.sha256) {
+              journaled(journal, { op: "config-merge-abort", status: "done", detail: { reason: "backup-changed" } });
               throw new Error(`The config backup at ${CONFIG_BACKUP_FILE} changed before the commit; refusing to replace the config. The original config is untouched; the foreign backup is preserved. Reconcile deliberately, then re-run.`);
             }
             const tempVerify = (lastStepFor(journal, "config-merge-temp")!.detail ?? {}) as { dev?: number; ino?: number; sha256?: string };
             const tempNow = fs.lstatSync(configTempAbs);
             if (tempNow.dev !== tempVerify.dev || tempNow.ino !== tempVerify.ino || sha256(fs.readFileSync(configTempAbs)) !== tempVerify.sha256) {
+              journaled(journal, { op: "config-merge-abort", status: "done", detail: { reason: "temp-changed" } });
               throw new Error(`The config merge temp at ${configTempRel} changed after it was journaled; refusing to install it. The original config is untouched; the foreign temp is preserved. Reconcile deliberately, then re-run.`);
             }
             // Detection recheck (not CAS): the live config must still be the
@@ -1195,11 +1251,13 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
               recheckStat.size !== origStat.size ||
               sha256(recheckBytes) !== origSha256
             ) {
+              journaled(journal, { op: "config-merge-abort", status: "done", detail: { reason: "config-changed" } });
               throw new Error(`shipgate.config.json changed during the migration (external write). The original config was left untouched; its backup at ${CONFIG_BACKUP_FILE} is retained. Re-run to resume.`);
             }
             try {
               fs.renameSync(configTempAbs, shipgateConfigAbs); // the single atomic replace
             } catch (error) {
+              journaled(journal, { op: "config-merge-abort", status: "done", detail: { reason: "rename-failed" } });
               throw new Error(`Failed to replace shipgate.config.json with the merged config: ${error instanceof Error ? error.message : String(error)}. The original config and its backup at ${CONFIG_BACKUP_FILE} are intact. Re-run to resume.`);
             }
             crashPoint("afterConfigRename"); // replaced, done not journaled

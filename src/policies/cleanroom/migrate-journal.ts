@@ -11,8 +11,11 @@ import path from "node:path";
  * each journaled piece. Every write fsyncs the file and its parent
  * directory so a crash cannot silently lose a recorded step.
  *
- * Recovery correctness never rests on the journal alone: every publication
- * is an exclusive create that is byte-verified on resume. A lost or stale
+ * Recovery correctness never rests on the journal alone: every state and
+ * marker publication is an exclusive create that is byte-verified on resume.
+ * The single bounded exception is the JSON config merge, which commits with
+ * one journaled atomic rename of a verified temp onto shipgate.config.json
+ * (the explicit authorized config-replace exception). A lost or stale
  * journal degrades diagnosis, never safety.
  *
  * Section 2.2: pure filesystem helpers; no console output, no exit codes.

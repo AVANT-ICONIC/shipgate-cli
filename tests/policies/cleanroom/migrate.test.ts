@@ -884,6 +884,53 @@ describe("cleanroom migration config-merge crash recovery (real SIGKILL)", () =>
     expectMerged(root);
   }, 300_000);
 
+  it("a committed config deleted between runs refuses the resume; it is never silently recreated as default-only", async () => {
+    const root = await legacyRepoWithConfig();
+    const crashed = await runChild(root, { [CRASH_ENV]: "afterConfigRename" });
+    expect(crashed.signal).toBe("SIGKILL");
+    const mergedBytes = readFileSync(path.join(root, "shipgate.config.json"), "utf8");
+    // The committed config disappears between runs; planning would call this
+    // "no config present" and happily create a default-only one.
+    rmSync(path.join(root, "shipgate.config.json"));
+    rmSync(path.join(root, LOCK)); // deliberate operator act
+    const refused = migrateCleanroom({ root });
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("no longer matches the journaled bytes");
+    expect(refused.stderr).toContain("is missing");
+    expect(existsSync(path.join(root, "shipgate.config.json"))).toBe(false); // nothing recreated
+    expect(existsSync(path.join(root, MARKER))).toBe(false);
+    // The operator restores the merged config deliberately; resume completes.
+    writeFileSync(path.join(root, "shipgate.config.json"), mergedBytes);
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
+    expectMerged(root);
+  }, 300_000);
+
+  it("a backup deleted after the committed merge refuses finalization; clean-slate re-migration recovers", async () => {
+    const root = await legacyRepoWithConfig();
+    const crashed = await runChild(root, { [CRASH_ENV]: "afterConfigCommit" });
+    expect(crashed.signal).toBe("SIGKILL"); // merge committed and journaled
+    rmSync(path.join(root, CONFIG_BACKUP)); // retained backup deleted between runs
+    rmSync(path.join(root, LOCK)); // deliberate operator act
+    const refused = migrateCleanroom({ root });
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("backup");
+    expect(refused.stderr).toContain("missing");
+    expect(existsSync(path.join(root, MARKER))).toBe(false); // never finalized without it
+    // The original bytes are unrecoverable from the merged config, so the
+    // operator reconciles deliberately: remove the partial destination and
+    // journal, then re-migrate from the untouched legacy state.
+    rmSync(path.join(root, ".shipgate"), { recursive: true, force: true });
+    const fresh = migrateCleanroom({ root });
+    expect(fresh.exitCode).toBe(0);
+    // The surviving config is already merged, so the fresh run is
+    // already-present (no new backup obligation); the destination and
+    // marker are rebuilt byte-verified from the untouched legacy state.
+    expect(JSON.parse(readFileSync(path.join(root, "shipgate.config.json"), "utf8"))).toMatchObject({ profile: "node-cli", policies: { cleanroom: { enabled: true } } });
+    expect(JSON.parse(readFileSync(path.join(root, MARKER), "utf8")).status).toBe("completed");
+    expect(readFileSync(path.join(root, MIGRATED_CONFIG))).toEqual(readFileSync(path.join(root, ".greenroom.json")));
+  }, 300_000);
+
   it("a foreign replacement of the journaled merge temp is preserved and refuses the resume", async () => {
     const root = await legacyRepoWithConfig();
     const crashed = await runChild(root, { [CRASH_ENV]: "afterConfigMergeTemp" });
@@ -901,10 +948,19 @@ describe("cleanroom migration config-merge crash recovery (real SIGKILL)", () =>
     // The foreign temp and the untouched config are both preserved.
     expect(readFileSync(tempAbs, "utf8")).toBe("foreign replacement, not the migration's temp\n");
     expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(ORIGINAL_CONFIG);
-    // The operator removes the foreign temp deliberately; the resume completes.
+    // Removing the temp does not unblock the resume: a journaled merge whose
+    // temp is gone while the config holds the original bytes is ambiguous
+    // (rename landed + reverted vs never landed), so it conflicts
+    // fail-closed rather than silently re-merging.
     rmSync(tempAbs);
-    const resumed = migrateCleanroom({ root });
-    expect(resumed.exitCode).toBe(0);
+    const ambiguous = migrateCleanroom({ root });
+    expect(ambiguous.exitCode).toBe(2);
+    expect(ambiguous.stderr).toContain("no longer matches the journaled bytes");
+    // The operator reconciles deliberately: clean-slate and re-migrate from
+    // the untouched legacy state.
+    rmSync(path.join(root, ".shipgate"), { recursive: true, force: true });
+    const fresh = migrateCleanroom({ root });
+    expect(fresh.exitCode).toBe(0);
     expectMerged(root);
   }, 300_000);
 });

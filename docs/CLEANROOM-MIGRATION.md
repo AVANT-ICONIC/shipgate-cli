@@ -13,11 +13,15 @@ expect. It describes current behavior on the migration branch.
   source, and the placed destination is verified before completion.
 - Old and new `check --json` must produce identical findings and exit codes
   before anything is published.
-- Publication uses exclusive-create operations only (O_EXCL copies, mkdir,
-  hardlinks). No public path is overwritten. On handled failures, published
-  state and your data are preserved; cleanup removes only journal-proven,
-  inode-verified private scratch (this run's staging, temps, journal, and an
-  empty reservation directory whose identity matches its journal record).
+- State and marker publication uses exclusive-create operations only
+  (O_EXCL copies, mkdir, hardlinks); no state or marker path is overwritten.
+  The one bounded exception is the JSON config merge, which commits with a
+  single journaled atomic rename of the verified merged temp onto
+  `shipgate.config.json` (see "Config handling"). On handled failures,
+  published state and your data are preserved; cleanup removes only
+  journal-proven, inode- and hash-verified private scratch (this run's
+  staging, temps, journal, and an empty reservation directory whose
+  identity matches its journal record).
 - The migration marker (`.shipgate/policies/cleanroom/migration.json`) is
   the commit point. It is written last, via an atomic no-replace link. For
   policy commands, the marker file's existence alone selects the migrated
@@ -86,11 +90,12 @@ removing the partial destination.
   foreign bytes are preserved and reported, and the backup and journal are
   retained for recovery. The single atomic rename of the verified merged
   temp onto `shipgate.config.json` is the explicit, authorized
-  config-replace exception; nothing else foreign is ever overwritten. JSON
-  re-serialization preserves values and key order, not comments or
-  whitespace. A symlinked, malformed, or non-object JSON config (including a
-  non-object `policies` or `policies.cleanroom` value) is refused with
-  exit 2 and no proposal.
+  config-replace exception; nothing else foreign is ever overwritten. A
+  config with comments is not valid JSON: it is refused as malformed, never
+  accepted with comments stripped. Re-serialization preserves values and
+  key order; whitespace is normalized. A symlinked, malformed, or non-object
+  JSON config (including a non-object `policies` or `policies.cleanroom`
+  value) is refused with exit 2 and no proposal.
 - TypeScript/JavaScript config: a proposed patch is written (same path
   rules); merge `policies.cleanroom` into your config and re-run. Known
   limitation: a code config cannot be inspected safely, so the command stops
