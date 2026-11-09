@@ -5,9 +5,7 @@ and `.greenroom/`) into the ShipGate layout (`.shipgate/policies/cleanroom.json`
 and `.shipgate/policies/cleanroom/`). Legacy state is never deleted.
 
 This page documents the failure and recovery behavior operators should
-expect. It describes current behavior on the migration branch; the handling
-of a pre-existing JSON `shipgate.config.json` (proposed merged file plus
-exit 2, no automatic merge) is a pending spec decision and may change.
+expect. It describes current behavior on the migration branch.
 
 ## What is guaranteed
 
@@ -73,12 +71,21 @@ removing the partial destination.
 ## Config handling
 
 - No `shipgate.config.*` exists: one is created with `policies.cleanroom`.
-- `shipgate.config.json` exists (pending spec decision): the migration
-  writes a proposed merged config to `.shipgate/policies/cleanroom.config-patch.json`
-  and exits with code 2. If that path is already taken by different content,
-  a uniquely suffixed path is written instead - use the exact path the
-  command reports. Review the proposal, replace `shipgate.config.json` with
-  it, and re-run.
+- `shipgate.config.json` exists: `policies.cleanroom` is merged in place and
+  unrelated values are preserved. The original is first copied byte-for-byte
+  to `.shipgate/policies/.cleanroom-migrate.config-backup` (mode 0600,
+  retained after the migration), the merged content is staged in a private
+  temp file carrying the original file's mode, the live config is
+  re-verified against the bytes that were merged, and a single atomic rename
+  commits it. Run the migration with editors, formatters, watchers, and
+  other ShipGate invocations stopped: the lock serializes migrators only and
+  cannot fence a writer that ignores it, and the pre-commit re-verification
+  is detection, not compare-and-swap. If the config changes between the read
+  and the commit, the migration fails closed with exit 2, leaves your
+  config untouched, and retains the backup and journal for recovery. JSON
+  re-serialization preserves values and key order, not comments or
+  whitespace. A symlinked, malformed, or non-object JSON config (including a
+  non-object `policies` value) is refused with exit 2 and no proposal.
 - TypeScript/JavaScript config: a proposed patch is written (same path
   rules); merge `policies.cleanroom` into your config and re-run. Known
   limitation: a code config cannot be inspected safely, so the command stops
