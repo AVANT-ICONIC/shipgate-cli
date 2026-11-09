@@ -777,21 +777,24 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
       if (mergeBegin) {
         const mergedSha256 = (mergeBegin.detail as { mergedSha256: string }).mergedSha256;
         const current = fs.existsSync(shipgateConfigAbs) ? sha256(fs.readFileSync(shipgateConfigAbs)) : null;
-        const commitDone = lastStepFor(journal, "config-commit")?.status === "done";
+        // Attempt binding: a config-merge-abort applies only to the attempt
+        // that precedes it. Records after the latest abort are a new
+        // attempt, and a historical abort never negates a later commit or
+        // live merged bytes.
+        const lastAbortIndex = journal.steps.reduce((acc, s, i) => (s.op === "config-merge-abort" ? i : acc), -1);
+        const afterAbort = journal.steps.slice(lastAbortIndex + 1);
+        const commitDone = afterAbort.some((s) => s.op === "config-commit" && s.status === "done");
         // The rename consumes the temp: a journaled temp whose file is gone
         // proves the merge committed even without its done record. A config
         // reverted to the original bytes after that is a conflict, not a
         // pre-commit resume; silently re-merging would hide a foreign
-        // between-run change.
-        const tempStep = lastStepFor(journal, "config-merge-temp");
-        // A journaled abort proves the rename never happened (handled
-        // pre-rename failures record one); without it, a consumed temp plus
-        // the original bytes back in place is an ambiguous post-commit
-        // state and must conflict, not silently re-merge.
-        const aborted = lastStepFor(journal, "config-merge-abort") !== null;
+        // between-run change. A journaled abort before the attempt instead
+        // proves the rename never happened (handled pre-rename failures
+        // record one).
+        const tempStep = [...afterAbort].reverse().find((s) => s.op === "config-merge-temp");
         const origSha256 = (mergeBegin.detail as { origSha256?: string }).origSha256;
         const tempConsumed = tempStep?.status === "done" && !fs.existsSync(path.join(root, tempStep.path ?? ""));
-        const committed = !aborted && (commitDone || current === mergedSha256 || (tempConsumed && current === origSha256));
+        const committed = commitDone || current === mergedSha256 || (tempConsumed && current === origSha256);
         if (current === null) {
           // A merge began and the config is gone: planning would call this
           // "no config present" and create a default-only one, losing the
@@ -806,7 +809,7 @@ export function migrateCleanroom(options: { root: string; dryRun?: boolean; json
             journaled(journal, { op: "config-commit", status: "done", path: "shipgate.config.json", sha256: mergedSha256 });
           }
           if (lastStepFor(journal, "config-backup") !== null && !fs.existsSync(configBackupAbs)) {
-            throw new Error(`The config backup recorded in the migration journal (${CONFIG_BACKUP_FILE}) is missing after the config merge was committed. The merged config contains no recoverable copy of the original bytes. Restore a byte-identical backup deliberately, or remove the destination, journal, and marker residue deliberately and re-run from the untouched legacy state.`);
+            throw new Error(`The config backup recorded in the migration journal (${CONFIG_BACKUP_FILE}) is missing after the config merge was committed. The merged config contains no recoverable copy of the original bytes. Remove the destination, journal, and marker residue deliberately, then re-run from the untouched legacy state.`);
           }
         }
       }

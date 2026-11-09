@@ -963,6 +963,114 @@ describe("cleanroom migration config-merge crash recovery (real SIGKILL)", () =>
     expect(fresh.exitCode).toBe(0);
     expectMerged(root);
   }, 300_000);
+
+  // Attempt binding: a journaled abort applies only to the attempt before
+  // it. After the operator repairs and retries, the retry's commit - or its
+  // live merged bytes - must not be negated by the historical abort.
+  const abortViaForeignTemp = (root: string): void => {
+    const result = migrateCleanroom({
+      root,
+      _hooks: {
+        beforeConfigCommit: (r) => {
+          const temp = readdirSync(r).find((e) => e.startsWith("shipgate.config.json.migrate-"))!;
+          writeFileSync(path.join(r, temp), JSON.stringify({ profile: "foreign" }, null, 2) + "\n");
+        },
+      },
+    });
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("changed after it was journaled");
+    // The foreign temp is preserved; the operator removes it deliberately.
+    const leftover = readdirSync(root).filter((e) => e.startsWith("shipgate.config.json.migrate-"));
+    expect(leftover.length).toBe(1);
+    rmSync(path.join(root, leftover[0]!));
+  };
+
+  for (const boundary of ["afterConfigRename", "afterConfigCommit"]) {
+    it(`abort, repair, retry SIGKILL at ${boundary}: the retry's committed merge still binds - a deleted backup refuses finalization`, async () => {
+      const root = await legacyRepoWithConfig();
+      abortViaForeignTemp(root); // handled abort journaled by attempt 1
+      // Attempt 2 (child): re-merges, installs the config, dies at the boundary.
+      const crashed = await runChild(root, { [CRASH_ENV]: boundary });
+      expect(crashed.signal).toBe("SIGKILL");
+      expect(JSON.parse(readFileSync(path.join(root, "shipgate.config.json"), "utf8"))).toMatchObject({ policies: { cleanroom: { enabled: true } } });
+      rmSync(path.join(root, CONFIG_BACKUP)); // retained backup deleted between runs
+      rmSync(path.join(root, LOCK)); // deliberate operator act
+      // The historical abort must not negate the retry's commit: finalizing
+      // without the retained backup is still refused.
+      const refused = migrateCleanroom({ root });
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr).toContain("backup");
+      expect(refused.stderr).toContain("missing");
+      expect(existsSync(path.join(root, MARKER))).toBe(false);
+      // The original bytes are unrecoverable from the merged config, so the
+      // operator reconciles deliberately: remove the partial destination and
+      // journal, then re-migrate from the untouched legacy state.
+      rmSync(path.join(root, ".shipgate"), { recursive: true, force: true });
+      const fresh = migrateCleanroom({ root });
+      expect(fresh.exitCode).toBe(0);
+      // The surviving config is already merged, so the fresh run is
+      // already-present (no new backup obligation); the destination and
+      // marker are rebuilt byte-verified from the untouched legacy state.
+      expect(JSON.parse(readFileSync(path.join(root, "shipgate.config.json"), "utf8"))).toMatchObject({ profile: "node-cli", policies: { cleanroom: { enabled: true } } });
+      expect(JSON.parse(readFileSync(path.join(root, MARKER), "utf8")).status).toBe("completed");
+      expect(readFileSync(path.join(root, MIGRATED_CONFIG))).toEqual(readFileSync(path.join(root, ".greenroom.json")));
+    }, 300_000);
+  }
+
+  it("abort, repair, retry SIGKILL at afterConfigRename with the backup intact: the resume completes - a historical abort never negates live merged bytes", async () => {
+    const root = await legacyRepoWithConfig();
+    abortViaForeignTemp(root); // handled abort journaled by attempt 1
+    const crashed = await runChild(root, { [CRASH_ENV]: "afterConfigRename" });
+    expect(crashed.signal).toBe("SIGKILL"); // merged config installed by the retry, done not journaled
+    rmSync(path.join(root, LOCK)); // deliberate operator act
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
+    expectMerged(root);
+  }, 300_000);
+
+  it("abort, repair, retry SIGKILL at afterConfigMergeTemp: the retry's journaled temp is adopted and the resume completes", async () => {
+    const root = await legacyRepoWithConfig();
+    abortViaForeignTemp(root); // handled abort journaled by attempt 1
+    const crashed = await runChild(root, { [CRASH_ENV]: "afterConfigMergeTemp" });
+    expect(crashed.signal).toBe("SIGKILL"); // retry's temp journaled, rename never happened
+    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(ORIGINAL_CONFIG);
+    rmSync(path.join(root, LOCK)); // deliberate operator act
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
+    expectMerged(root);
+  }, 300_000);
+
+  it("abort, repair, retry SIGKILL at afterConfigRename, then the config reverted to the original bytes: ambiguous, refuses - never a silent re-merge", async () => {
+    const root = await legacyRepoWithConfig();
+    abortViaForeignTemp(root); // handled abort journaled by attempt 1
+    const crashed = await runChild(root, { [CRASH_ENV]: "afterConfigRename" });
+    expect(crashed.signal).toBe("SIGKILL"); // retry's rename consumed its temp
+    const mergedBytes = readFileSync(path.join(root, "shipgate.config.json"), "utf8");
+    // Between runs the config is put back to the original bytes: the
+    // journaled temp is gone, so the retry's merge committed; original
+    // bytes now are a conflict, not a pre-commit resume.
+    writeFileSync(path.join(root, "shipgate.config.json"), ORIGINAL_CONFIG);
+    rmSync(path.join(root, LOCK)); // deliberate operator act
+    const refused = migrateCleanroom({ root });
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("no longer matches the journaled bytes");
+    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(ORIGINAL_CONFIG); // preserved
+    // The operator restores the merged bytes deliberately; the resume completes.
+    writeFileSync(path.join(root, "shipgate.config.json"), mergedBytes);
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
+    expectMerged(root);
+  }, 300_000);
+
+  it("two handled aborts in a row: the latest attempt binds, the clean retry completes", async () => {
+    const root = await legacyRepoWithConfig();
+    abortViaForeignTemp(root); // attempt 1 aborts
+    abortViaForeignTemp(root); // attempt 2 aborts the same way
+    expect(readFileSync(path.join(root, "shipgate.config.json"), "utf8")).toBe(ORIGINAL_CONFIG);
+    const resumed = migrateCleanroom({ root });
+    expect(resumed.exitCode).toBe(0);
+    expectMerged(root);
+  }, 300_000);
 });
 
 describe("cleanroom migration real-crash recovery (reviewed protocol)", () => {
